@@ -20,6 +20,8 @@ const STREAMER_NAME = process.env.STREAMER_NAME || "Streamer";
 const AUTO_SEND = String(process.env.AUTO_SEND || "true").toLowerCase() === "true";
 const DECISION_MODEL = process.env.OPENAI_DECISION_MODEL || "gpt-4.1-mini";
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+const MIN_SEND_INTERVAL_MS = Number(process.env.MIN_SEND_INTERVAL_MS || 35000);
+
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 
@@ -169,6 +171,50 @@ function isRepeat(candidate) {
 function remember(reply) {
   history.push(reply);
   while (history.length > MAX_HISTORY) history.shift();
+}
+
+function hasClearStreamerTrigger(transcript) {
+  const t = String(transcript || "").toLowerCase().trim();
+  if (!t) return false;
+
+  // Direct questions / clear invitations are always strong triggers.
+  if (/[?]/.test(t)) return true;
+
+  // General emotional, conversational, or situational cues.
+  // These are intentionally NOT gaming-specific.
+  const triggerPatterns = [
+    /(chat|yo|bro|bruh|gang|twin|my boy|look|watch|listen|hold on|wait)/i,
+    /(no way|what the|wtf|damn|wow|crazy|wild|insane|funny|hilarious)/i,
+    /(i love|i hate|i like|i don't like|i dont like|i can't believe|i cant believe)/i,
+    /(how did|why did|what happened|what is|what was|who is|where is|when is)/i,
+    /(y'all think|yall think|you think|should i|would you|did y'all|did yall|did you)/i,
+    /(look at this|check this out|this is crazy|that's crazy|thats crazy)/i,
+    /(lets go|let's go|finally|there we go|i knew it|called it)/i,
+    /(ain't no way|aint no way|nahhh|nah bro|oh my god|omg)/i
+  ];
+
+  return triggerPatterns.some(rx => rx.test(t));
+}
+
+function isGenericBottyReply(reply) {
+  const r = String(reply || "").toLowerCase().trim();
+
+  // Phrases we specifically do NOT want during idle moments.
+  const bannedPatterns = [
+    /\bvibes?\b/i,
+    /\benergy\b/i,
+    /\bready for action\b/i,
+    /\bready to roll\b/i,
+    /\bsquad looks\b/i,
+    /\bcrew'?s energy\b/i,
+    /\banother level\b/i,
+    /\bpower move\b/i,
+    /\bstraight chillin'? let's go\b/i,
+    /\bchill energy\b/i,
+    /\bsolid, ready\b/i
+  ];
+
+  return bannedPatterns.some(rx => rx.test(r));
 }
 
 // ---------- Kick token helpers ----------
@@ -446,8 +492,15 @@ app.post("/api/decide", async (req, res) => {
       return res.json({ action: "skip", reason: "no speech" });
     }
 
-    if (Date.now() - lastSent < 12_000) {
+    if (Date.now() - lastSent < MIN_SEND_INTERVAL_MS) {
       return res.json({ action: "skip", reason: "cooldown" });
+    }
+
+    // HARD IDLE GATE:
+    // If the streamer is merely talking casually / sitting there with no clear
+    // reaction, question, joke, or event, stay silent.
+    if (!hasClearStreamerTrigger(transcript)) {
+      return res.json({ action: "skip", reason: "no clear moment to respond to" });
     }
 
     const content = [{
@@ -463,14 +516,42 @@ ${recent || "(none)"}
 Recent AI replies:
 ${history.slice(-15).join("\n") || "(none)"}
 
-Reply mainly to the streamer based on what they say and what is visible on stream.
-Stay quiet if there is no useful moment. Output exactly SKIP when quiet.
-Keep replies 2-12 words, one short sentence max.
-Use casual gaming-stream chat style.
-Light slang such as bruh, gang, my boy, ngl, lowkey, fr, cooked, sold, or locked in is okay occasionally, not every message.
-Never pretend to be a human viewer or claim human experiences.
-Do not repeat or lightly reword recent replies.
-Return only the chat message or exactly SKIP.`
+CONTEXT-FIRST BEHAVIOR:
+- First determine what kind of moment is actually happening RIGHT NOW from the speech + screenshot.
+- Do NOT assume this is gaming.
+- The stream may be gaming, Just Chatting, IRL, cars, cooking, music, reactions, shopping, storytelling, sports, tutorials, unboxing, travel, or something else.
+- Adapt your vocabulary and reaction to the actual scene.
+- Your default state is SILENCE.
+- If the streamer is simply sitting, chilling, waiting, scrolling, browsing, driving quietly, eating, or casually talking with no clear moment to respond to, output exactly SKIP.
+- Never send generic hype just because the stream is live.
+- Reply only when there is a clear reason: a direct question, obvious joke, strong reaction, surprising visual moment, interesting statement, disagreement, reveal, accomplishment, mistake, awkward/funny moment, or the streamer clearly invites a response.
+- The screenshot is evidence. Do not invent an event that is not visible or supported by the speech.
+- If the speech and screenshot disagree, be conservative and output SKIP.
+- If you are not at least 85% sure a response improves the moment, output exactly SKIP.
+
+CONTEXT EXAMPLES:
+- Gaming: react to the actual play, death, win, miss, clutch, menu choice, etc.
+- Just Chatting: respond to the specific story, opinion, joke, or question being discussed.
+- Cars: react to the actual car, mod, sound, comparison, problem, or reveal on screen.
+- Cooking/food: react to the actual dish, ingredient, result, mistake, or taste discussion.
+- IRL: react to what visibly happens around the streamer or what they specifically say.
+- Music: react to the discussion/performance without quoting lyrics.
+- Reactions/videos: react to the specific thing the streamer is reacting to, not generic "vibes."
+- Shopping/unboxing: react to the actual item, price, feature, reveal, or opinion.
+
+STYLE:
+- 2-10 words most of the time.
+- Casual stream-chat tone, not polished assistant language.
+- Match the topic naturally. Do not force gaming terms into non-gaming streams.
+- Light slang is okay occasionally: bruh, gang, my boy, twin, ngl, lowkey, fr, cooked, sold, locked in.
+- Most replies should use no slang.
+- Never stack slang.
+- Never use generic filler such as "vibes are solid", "energy is on another level", "ready for action", "ready to roll", "power move", or similar hype-template language.
+- Never pretend to be a human viewer or claim personal human experiences.
+- Do not repeat or lightly reword recent replies.
+- If you cannot make a SPECIFIC reply tied to what JUST happened or what the streamer JUST said, output exactly SKIP.
+
+Return only the short chat message or exactly SKIP.`
     }];
 
     if (frame.startsWith("data:image/")) {
@@ -499,9 +580,17 @@ Return only the chat message or exactly SKIP.`
       return res.json({ action: "skip", reason: "repeat" });
     }
 
+    if (isGenericBottyReply(reply)) {
+      return res.json({ action: "skip", reason: "generic botty reply blocked" });
+    }
+
     if (!AUTO_SEND) {
       return res.json({ action: "preview", reply });
     }
+
+    // Small natural pause after deciding, instead of instant posting.
+    const naturalDelayMs = 2500 + Math.floor(Math.random() * 4500);
+    await new Promise(resolve => setTimeout(resolve, naturalDelayMs));
 
     await sendKick(req, res, reply);
     lastSent = Date.now();
