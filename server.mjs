@@ -21,6 +21,12 @@ const AUTO_SEND = String(process.env.AUTO_SEND || "true").toLowerCase() === "tru
 const DECISION_MODEL = process.env.OPENAI_DECISION_MODEL || "gpt-4.1-mini";
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 const MIN_SEND_INTERVAL_MS = Number(process.env.MIN_SEND_INTERVAL_MS || 35000);
+const PROACTIVE_CHAT = String(process.env.PROACTIVE_CHAT || "true").toLowerCase() === "true";
+const PROACTIVE_MIN_IDLE_MS = Number(process.env.PROACTIVE_MIN_IDLE_MS || 120000);
+const PROACTIVE_MAX_IDLE_MS = Number(process.env.PROACTIVE_MAX_IDLE_MS || 240000);
+const CONVERSATION_FOLLOWUP_WINDOW_MS = Number(process.env.CONVERSATION_FOLLOWUP_WINDOW_MS || 90000);
+const CONVERSATION_MAX_BOT_TURNS = Number(process.env.CONVERSATION_MAX_BOT_TURNS || 4);
+
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
@@ -32,7 +38,7 @@ if (!SESSION_SECRET) {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
 
-const DASHBOARD_HTML = "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>Backendboys AI Co-host</title>\n  <style>\nbody{font-family:Arial,sans-serif;background:#0b0b0c;color:#f5f5f5;margin:0}\nmain{max-width:900px;margin:30px auto;padding:0 18px}\nsection{background:#151518;border:1px solid #303036;border-radius:14px;padding:18px;margin:14px 0}\ninput{width:100%;box-sizing:border-box;padding:11px;margin:8px 0;background:#0e0e10;color:#fff;border:1px solid #3a3a40;border-radius:9px}\nbutton,.btn{display:inline-block;padding:10px 13px;margin:5px 6px 5px 0;border-radius:9px;border:1px solid #444;background:#242428;color:white;text-decoration:none;cursor:pointer}\nvideo{width:100%;max-height:360px;background:black;margin-top:12px;border-radius:10px}\n#reply{font-size:20px;padding:14px;background:#0e0e10;border-radius:10px;margin:10px 0}\npre{white-space:pre-wrap;background:#111;padding:12px;border-radius:10px;color:#a9dda9}\n</style>\n</head>\n<body>\n<main>\n  <h1>Backendboys AI Co-host</h1>\n  <p>Cloud mode \u2022 No OBS \u2022 No Tampermonkey.</p>\n\n  <section>\n    <h2>1. Kick OAuth</h2>\n    <a class=\"btn\" href=\"/auth/kick/start\">Authorize AI Kick account</a>\n    <div id=\"kick\"></div>\n  </section>\n\n  <section>\n    <h2>2. Stream channel</h2>\n    <input id=\"slug\" placeholder=\"Your channel name\">\n    <button id=\"resolve\">Resolve broadcaster ID</button>\n    <div id=\"channel\"></div>\n  </section>\n\n  <section>\n    <h2>3. Test official chat posting</h2>\n    <input id=\"testText\" value=\"AI co-host connection test \u2705\">\n    <button id=\"test\">Send test message</button>\n    <div id=\"testStatus\"></div>\n  </section>\n\n  <section>\n    <h2>4. Watch stream</h2>\n    <p>Open your live Kick stream in another tab. Click Start, choose that Kick tab, and enable <b>Share tab audio</b>.</p>\n    <button id=\"start\">Start stream watch</button>\n    <button id=\"stop\" disabled>Stop</button>\n    <div id=\"watch\">Stopped</div>\n    <div><b>Latest heard:</b> <span id=\"heard\">(nothing yet)</span></div>\n    <video id=\"preview\" muted playsinline></video>\n  </section>\n\n  <section>\n    <h2>5. AI reply</h2>\n    <div id=\"mode\"></div>\n    <div id=\"reply\">(waiting)</div>\n    <button id=\"sendPreview\" disabled>Send preview to Kick</button>\n    <div id=\"replyStatus\"></div>\n  </section>\n\n  <pre id=\"log\"></pre>\n</main>\n<script>\nconst $ = id => document.getElementById(id);\nlet statusInfo, stream, recorder, running=false, busy=false, recent=[], pending=\"\";\n\nfunction log(s){ $(\"log\").textContent = `[${new Date().toLocaleTimeString()}] ${s}\\n` + $(\"log\").textContent; }\nasync function j(url, options={}){\n  const r = await fetch(url,{...options,headers:{...(options.body && !(options.body instanceof Blob)?{\"Content-Type\":\"application/json\"}:{}),...(options.headers||{})}});\n  const d = await r.json().catch(()=>({}));\n  if(!r.ok) throw new Error(d.error||r.statusText);\n  return d;\n}\nasync function load(){\n  statusInfo=await j(\"/api/status\");\n  $(\"kick\").textContent=statusInfo.kickAuthorized?\"Kick authorized \u2705\":\"Kick not authorized\";\n  $(\"slug\").value=statusInfo.channelSlug||\"\";\n  $(\"channel\").textContent=statusInfo.broadcasterId?`Broadcaster ID: ${statusInfo.broadcasterId}`:\"Not resolved\";\n  $(\"mode\").textContent=statusInfo.autoSend?\"AUTO_SEND=true\":\"AUTO_SEND=false \u2014 preview first\";\n}\n$(\"resolve\").onclick=async()=>{\n  try{\n    const d=await j(\"/api/resolve-channel\",{method:\"POST\",body:JSON.stringify({slug:$(\"slug\").value})});\n    $(\"channel\").textContent=`Broadcaster ID: ${d.broadcasterId} \u2705`;\n  }catch(e){$(\"channel\").textContent=e.message}\n};\n$(\"test\").onclick=async()=>{\n  try{\n    await j(\"/api/test\",{method:\"POST\",body:JSON.stringify({content:$(\"testText\").value})});\n    $(\"testStatus\").textContent=\"Sent \u2705\";\n  }catch(e){$(\"testStatus\").textContent=e.message}\n};\nfunction frame(){\n  const v=$(\"preview\");\n  if(v.readyState<2) return \"\";\n  const c=document.createElement(\"canvas\"), w=Math.min(640,v.videoWidth), h=Math.round(v.videoHeight/v.videoWidth*w);\n  c.width=w;c.height=h;c.getContext(\"2d\").drawImage(v,0,0,w,h);\n  return c.toDataURL(\"image/jpeg\",0.6);\n}\nasync function transcribe(blob){\n  const r=await fetch(\"/api/transcribe\",{method:\"POST\",headers:{\"Content-Type\":blob.type||\"audio/webm\"},body:blob});\n  const d=await r.json(); if(!r.ok) throw new Error(d.error||\"transcription failed\"); return d.text||\"\";\n}\nasync function decide(text){\n  if(busy||!text)return; busy=true;\n  try{\n    const d=await j(\"/api/decide\",{method:\"POST\",body:JSON.stringify({transcript:text,recentTranscript:recent.join(\" | \"),frameDataUrl:frame()})});\n    if(d.action===\"skip\"){ $(\"replyStatus\").textContent=`Stayed quiet (${d.reason})`; return; }\n    $(\"reply\").textContent=d.reply;\n    if(d.action===\"preview\"){ pending=d.reply; $(\"sendPreview\").disabled=false; $(\"replyStatus\").textContent=\"Preview ready\"; }\n    if(d.action===\"sent\"){ pending=\"\"; $(\"sendPreview\").disabled=true; $(\"replyStatus\").textContent=\"Sent \u2705\"; }\n  }catch(e){$(\"replyStatus\").textContent=e.message}finally{busy=false}\n}\n$(\"sendPreview\").onclick=async()=>{\n  try{\n    await j(\"/api/send-preview\",{method:\"POST\",body:JSON.stringify({reply:pending})});\n    $(\"replyStatus\").textContent=\"Sent \u2705\"; pending=\"\"; $(\"sendPreview\").disabled=true;\n  }catch(e){$(\"replyStatus\").textContent=e.message}\n};\nfunction nextChunk(){\n  if(!running||!stream)return;\n  const tracks=stream.getAudioTracks();\n  if(!tracks.length){$(\"watch\").textContent=\"No audio. Restart and enable Share tab audio.\";return}\n  const mime=[\"audio/webm;codecs=opus\",\"audio/webm\",\"video/webm\"].find(x=>MediaRecorder.isTypeSupported(x))||\"\";\n  const parts=[]; recorder=mime?new MediaRecorder(new MediaStream(tracks),{mimeType:mime}):new MediaRecorder(new MediaStream(tracks));\n  recorder.ondataavailable=e=>{if(e.data?.size)parts.push(e.data)};\n  recorder.onstop=async()=>{\n    if(!running)return;\n    setTimeout(nextChunk,40);\n    try{\n      const blob=new Blob(parts,{type:recorder.mimeType||\"audio/webm\"});\n      if(blob.size<1200)return;\n      $(\"watch\").textContent=\"Transcribing\u2026\";\n      const text=(await transcribe(blob)).trim();\n      if(!text){$(\"watch\").textContent=\"Watching \u2014 no clear speech\";return}\n      $(\"heard\").textContent=text; recent.push(text); recent=recent.slice(-4); log(\"Heard: \"+text);\n      await decide(text); $(\"watch\").textContent=\"Watching + listening\";\n    }catch(e){$(\"watch\").textContent=e.message}\n  };\n  recorder.start(); setTimeout(()=>{if(recorder?.state===\"recording\")recorder.stop()},9000);\n}\n$(\"start\").onclick=async()=>{\n  try{\n    stream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});\n    if(!stream.getAudioTracks().length)throw new Error(\"Enable Share tab audio.\");\n    $(\"preview\").srcObject=stream; await $(\"preview\").play();\n    running=true;$(\"start\").disabled=true;$(\"stop\").disabled=false;$(\"watch\").textContent=\"Watching + listening\";\n    stream.getTracks().forEach(t=>t.addEventListener(\"ended\",()=>$(\"stop\").click()));\n    nextChunk();\n  }catch(e){$(\"watch\").textContent=e.message}\n};\n$(\"stop\").onclick=()=>{\n  running=false;try{if(recorder?.state===\"recording\")recorder.stop()}catch{}\n  try{stream?.getTracks().forEach(t=>t.stop())}catch{}\n  stream=null;$(\"preview\").srcObject=null;$(\"start\").disabled=false;$(\"stop\").disabled=true;$(\"watch\").textContent=\"Stopped\";\n};\nload().catch(e=>log(e.message));\n</script>\n</body>\n</html>";
+const DASHBOARD_HTML = "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>Backendboys AI Co-host</title>\n  <style>\nbody{font-family:Arial,sans-serif;background:#0b0b0c;color:#f5f5f5;margin:0}\nmain{max-width:900px;margin:30px auto;padding:0 18px}\nsection{background:#151518;border:1px solid #303036;border-radius:14px;padding:18px;margin:14px 0}\ninput{width:100%;box-sizing:border-box;padding:11px;margin:8px 0;background:#0e0e10;color:#fff;border:1px solid #3a3a40;border-radius:9px}\nbutton,.btn{display:inline-block;padding:10px 13px;margin:5px 6px 5px 0;border-radius:9px;border:1px solid #444;background:#242428;color:white;text-decoration:none;cursor:pointer}\nvideo{width:100%;max-height:360px;background:black;margin-top:12px;border-radius:10px}\n#reply{font-size:20px;padding:14px;background:#0e0e10;border-radius:10px;margin:10px 0}\npre{white-space:pre-wrap;background:#111;padding:12px;border-radius:10px;color:#a9dda9}\n</style>\n</head>\n<body>\n<main>\n  <h1>Backendboys AI Co-host</h1>\n  <p>Cloud mode \u2022 No OBS \u2022 No Tampermonkey.</p>\n\n  <section>\n    <h2>1. Kick OAuth</h2>\n    <a class=\"btn\" href=\"/auth/kick/start\">Authorize AI Kick account</a>\n    <div id=\"kick\"></div>\n  </section>\n\n  <section>\n    <h2>2. Stream channel</h2>\n    <input id=\"slug\" placeholder=\"Your channel name\">\n    <button id=\"resolve\">Resolve broadcaster ID</button>\n    <div id=\"channel\"></div>\n  </section>\n\n  <section>\n    <h2>3. Test official chat posting</h2>\n    <input id=\"testText\" value=\"AI co-host connection test \u2705\">\n    <button id=\"test\">Send test message</button>\n    <div id=\"testStatus\"></div>\n  </section>\n\n  <section>\n    <h2>4. Watch stream</h2>\n    <p>Open your live Kick stream in another tab. Click Start, choose that Kick tab, and enable <b>Share tab audio</b>.</p>\n    <button id=\"start\">Start stream watch</button>\n    <button id=\"stop\" disabled>Stop</button>\n    <div id=\"watch\">Stopped</div>\n    <div><b>Latest heard:</b> <span id=\"heard\">(nothing yet)</span></div>\n    <video id=\"preview\" muted playsinline></video>\n  </section>\n\n  <section>\n    <h2>5. AI reply</h2>\n    <div id=\"mode\"></div>\n    <div id=\"reply\">(waiting)</div>\n    <button id=\"sendPreview\" disabled>Send preview to Kick</button>\n    <div id=\"replyStatus\"></div>\n  </section>\n\n  <pre id=\"log\"></pre>\n</main>\n<script>\nconst $ = id => document.getElementById(id);\nlet statusInfo, stream, recorder, running=false, busy=false, recent=[], pending=\"\";\n\nfunction log(s){ $(\"log\").textContent = `[${new Date().toLocaleTimeString()}] ${s}\\n` + $(\"log\").textContent; }\nasync function j(url, options={}){\n  const r = await fetch(url,{...options,headers:{...(options.body && !(options.body instanceof Blob)?{\"Content-Type\":\"application/json\"}:{}),...(options.headers||{})}});\n  const d = await r.json().catch(()=>({}));\n  if(!r.ok) throw new Error(d.error||r.statusText);\n  return d;\n}\nasync function load(){\n  statusInfo=await j(\"/api/status\");\n  $(\"kick\").textContent=statusInfo.kickAuthorized?\"Kick authorized \u2705\":\"Kick not authorized\";\n  $(\"slug\").value=statusInfo.channelSlug||\"\";\n  $(\"channel\").textContent=statusInfo.broadcasterId?`Broadcaster ID: ${statusInfo.broadcasterId}`:\"Not resolved\";\n  $(\"mode\").textContent=statusInfo.autoSend?\"AUTO_SEND=true\":\"AUTO_SEND=false \u2014 preview first\";\n}\n$(\"resolve\").onclick=async()=>{\n  try{\n    const d=await j(\"/api/resolve-channel\",{method:\"POST\",body:JSON.stringify({slug:$(\"slug\").value})});\n    $(\"channel\").textContent=`Broadcaster ID: ${d.broadcasterId} \u2705`;\n  }catch(e){$(\"channel\").textContent=e.message}\n};\n$(\"test\").onclick=async()=>{\n  try{\n    await j(\"/api/test\",{method:\"POST\",body:JSON.stringify({content:$(\"testText\").value})});\n    $(\"testStatus\").textContent=\"Sent \u2705\";\n  }catch(e){$(\"testStatus\").textContent=e.message}\n};\nfunction frame(){\n  const v=$(\"preview\");\n  if(v.readyState<2) return \"\";\n  const c=document.createElement(\"canvas\"), w=Math.min(640,v.videoWidth), h=Math.round(v.videoHeight/v.videoWidth*w);\n  c.width=w;c.height=h;c.getContext(\"2d\").drawImage(v,0,0,w,h);\n  return c.toDataURL(\"image/jpeg\",0.6);\n}\nasync function transcribe(blob){\n  const r=await fetch(\"/api/transcribe\",{method:\"POST\",headers:{\"Content-Type\":blob.type||\"audio/webm\"},body:blob});\n  const d=await r.json(); if(!r.ok) throw new Error(d.error||\"transcription failed\"); return d.text||\"\";\n}\nasync function decide(text){\n  if(busy||!text)return; busy=true;\n  try{\n    const d=await j(\"/api/decide\",{method:\"POST\",body:JSON.stringify({transcript:text,recentTranscript:recent.join(\" | \"),frameDataUrl:frame()})});\n    if(d.action===\"skip\"){ $(\"replyStatus\").textContent=`Stayed quiet (${d.reason})`; return; }\n    $(\"reply\").textContent=d.reply;\n    if(d.action===\"preview\"){ pending=d.reply; $(\"sendPreview\").disabled=false; $(\"replyStatus\").textContent=\"Preview ready\"; }\n    if(d.action===\"sent\"){ pending=\"\"; $(\"sendPreview\").disabled=true; $(\"replyStatus\").textContent=\"Sent \u2705\"; }\n  }catch(e){$(\"replyStatus\").textContent=e.message}finally{busy=false}\n}\n$(\"sendPreview\").onclick=async()=>{\n  try{\n    await j(\"/api/send-preview\",{method:\"POST\",body:JSON.stringify({reply:pending})});\n    $(\"replyStatus\").textContent=\"Sent \u2705\"; pending=\"\"; $(\"sendPreview\").disabled=true;\n  }catch(e){$(\"replyStatus\").textContent=e.message}\n};\nfunction nextChunk(){\n  if(!running||!stream)return;\n  const tracks=stream.getAudioTracks();\n  if(!tracks.length){$(\"watch\").textContent=\"No audio. Restart and enable Share tab audio.\";return}\n  const mime=[\"audio/webm;codecs=opus\",\"audio/webm\",\"video/webm\"].find(x=>MediaRecorder.isTypeSupported(x))||\"\";\n  const parts=[]; recorder=mime?new MediaRecorder(new MediaStream(tracks),{mimeType:mime}):new MediaRecorder(new MediaStream(tracks));\n  recorder.ondataavailable=e=>{if(e.data?.size)parts.push(e.data)};\n  recorder.onstop=async()=>{\n    if(!running)return;\n    setTimeout(nextChunk,40);\n    try{\n      const blob=new Blob(parts,{type:recorder.mimeType||\"audio/webm\"});\n      if(blob.size<1200)return;\n      $(\"watch\").textContent=\"Transcribing\u2026\";\n      const text=(await transcribe(blob)).trim();\n      if(!text){\n        $(\"watch\").textContent=\"Watching \u2014 no clear speech\";\n        await decide(\"\");\n        $(\"watch\").textContent=\"Watching + listening\";\n        return;\n      }\n      $(\"heard\").textContent=text;\n      recent.push(text);\n      recent=recent.slice(-6);\n      log(\"Heard: \"+text);\n      await decide(text);\n      $(\"watch\").textContent=\"Watching + listening\";\n    }catch(e){$(\"watch\").textContent=e.message}\n  };\n  recorder.start(); setTimeout(()=>{if(recorder?.state===\"recording\")recorder.stop()},9000);\n}\n$(\"start\").onclick=async()=>{\n  try{\n    stream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});\n    if(!stream.getAudioTracks().length)throw new Error(\"Enable Share tab audio.\");\n    $(\"preview\").srcObject=stream; await $(\"preview\").play();\n    running=true;$(\"start\").disabled=true;$(\"stop\").disabled=false;$(\"watch\").textContent=\"Watching + listening\";\n    stream.getTracks().forEach(t=>t.addEventListener(\"ended\",()=>$(\"stop\").click()));\n    nextChunk();\n  }catch(e){$(\"watch\").textContent=e.message}\n};\n$(\"stop\").onclick=()=>{\n  running=false;try{if(recorder?.state===\"recording\")recorder.stop()}catch{}\n  try{stream?.getTracks().forEach(t=>t.stop())}catch{}\n  stream=null;$(\"preview\").srcObject=null;$(\"start\").disabled=false;$(\"stop\").disabled=true;$(\"watch\").textContent=\"Stopped\";\n};\nload().catch(e=>log(e.message));\n</script>\n</body>\n</html>";
 
 // ---------- Basic dashboard protection ----------
 app.use((req, res, next) => {
@@ -137,6 +143,40 @@ function getEncryptedCookie(req, name) {
 const history = [];
 const MAX_HISTORY = 60;
 let lastSent = 0;
+
+// Short-term conversation memory for this running stream session.
+const dialogueHistory = [];
+const MAX_DIALOGUE_ITEMS = 18;
+let conversationActiveUntil = 0;
+let conversationBotTurns = 0;
+let lastStreamerSpeechAt = 0;
+let nextProactiveAt = Date.now() + randomProactiveDelay();
+
+function randomProactiveDelay() {
+  const min = Math.max(30000, PROACTIVE_MIN_IDLE_MS);
+  const max = Math.max(min, PROACTIVE_MAX_IDLE_MS);
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function rememberDialogue(role, message) {
+  const clean = String(message || "").replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  dialogueHistory.push({ role, text: clean, at: Date.now() });
+  while (dialogueHistory.length > MAX_DIALOGUE_ITEMS) dialogueHistory.shift();
+}
+
+function conversationIsActive() {
+  return Date.now() < conversationActiveUntil &&
+         conversationBotTurns < CONVERSATION_MAX_BOT_TURNS;
+}
+
+function openConversationWindow() {
+  conversationActiveUntil = Date.now() + CONVERSATION_FOLLOWUP_WINDOW_MS;
+}
+
+function scheduleNextProactive() {
+  nextProactiveAt = Date.now() + randomProactiveDelay();
+}
 
 function normalize(s) {
   return String(s || "")
@@ -487,69 +527,108 @@ app.post("/api/decide", async (req, res) => {
     const transcript = String(req.body?.transcript || "").trim();
     const recent = String(req.body?.recentTranscript || "").trim();
     const frame = String(req.body?.frameDataUrl || "");
+    const now = Date.now();
 
-    if (!transcript) {
-      return res.json({ action: "skip", reason: "no speech" });
+    if (transcript) {
+      lastStreamerSpeechAt = now;
+      rememberDialogue("streamer", transcript);
     }
 
-    if (Date.now() - lastSent < MIN_SEND_INTERVAL_MS) {
+    if (now - lastSent < MIN_SEND_INTERVAL_MS) {
       return res.json({ action: "skip", reason: "cooldown" });
     }
 
-    // HARD IDLE GATE:
-    // If the streamer is merely talking casually / sitting there with no clear
-    // reaction, question, joke, or event, stay silent.
-    if (!hasClearStreamerTrigger(transcript)) {
+    const activeConversation = conversationIsActive();
+
+    // A proactive opener is allowed only after a real quiet interval.
+    const proactiveTurn =
+      !transcript &&
+      PROACTIVE_CHAT &&
+      now >= nextProactiveAt &&
+      !activeConversation;
+
+    // While a short conversation is active, even short answers such as
+    // "yeah", "nah", "fr", etc. may continue the same topic.
+    const followupTurn = Boolean(transcript) && activeConversation;
+
+    const normalTriggeredTurn =
+      Boolean(transcript) && hasClearStreamerTrigger(transcript);
+
+    if (!proactiveTurn && !followupTurn && !normalTriggeredTurn) {
       return res.json({ action: "skip", reason: "no clear moment to respond to" });
     }
+
+    const turnMode = proactiveTurn
+      ? "PROACTIVE_OPENER"
+      : followupTurn
+        ? "CONVERSATION_FOLLOWUP"
+        : "NORMAL_REACTION";
+
+    const dialogueText = dialogueHistory
+      .slice(-12)
+      .map(x => `${x.role === "streamer" ? "STREAMER" : "AI"}: ${x.text}`)
+      .join("\n") || "(none)";
 
     const content = [{
       type: "input_text",
       text: `You are ${BOT_NAME}, a clearly identified AI co-host for ${STREAMER_NAME}'s Kick stream.
 
-Current speech:
-${transcript}
-
-Recent speech:
-${recent || "(none)"}
-
 Recent AI replies:
 ${history.slice(-15).join("\n") || "(none)"}
 
-CONTEXT-FIRST BEHAVIOR:
-- First determine what kind of moment is actually happening RIGHT NOW from the speech + screenshot.
-- Do NOT assume this is gaming.
-- The stream may be gaming, Just Chatting, IRL, cars, cooking, music, reactions, shopping, storytelling, sports, tutorials, unboxing, travel, or something else.
-- Adapt your vocabulary and reaction to the actual scene.
-- Your default state is SILENCE.
-- If the streamer is simply sitting, chilling, waiting, scrolling, browsing, driving quietly, eating, or casually talking with no clear moment to respond to, output exactly SKIP.
-- Never send generic hype just because the stream is live.
-- Reply only when there is a clear reason: a direct question, obvious joke, strong reaction, surprising visual moment, interesting statement, disagreement, reveal, accomplishment, mistake, awkward/funny moment, or the streamer clearly invites a response.
-- The screenshot is evidence. Do not invent an event that is not visible or supported by the speech.
-- If the speech and screenshot disagree, be conservative and output SKIP.
-- If you are not at least 85% sure a response improves the moment, output exactly SKIP.
+CONVERSATION MODE:
+Current turn mode: ${turnMode}
 
-CONTEXT EXAMPLES:
-- Gaming: react to the actual play, death, win, miss, clutch, menu choice, etc.
-- Just Chatting: respond to the specific story, opinion, joke, or question being discussed.
-- Cars: react to the actual car, mod, sound, comparison, problem, or reveal on screen.
-- Cooking/food: react to the actual dish, ingredient, result, mistake, or taste discussion.
-- IRL: react to what visibly happens around the streamer or what they specifically say.
-- Music: react to the discussion/performance without quoting lyrics.
-- Reactions/videos: react to the specific thing the streamer is reacting to, not generic "vibes."
-- Shopping/unboxing: react to the actual item, price, feature, reveal, or opinion.
+Recent back-and-forth:
+${dialogueText}
+
+Current speech:
+${transcript || "(no new speech — this may be a proactive opener tick)"}
+
+Recent speech context:
+${recent || "(none)"}
+
+CONTEXT-FIRST BEHAVIOR:
+- First determine what is actually happening RIGHT NOW from speech + screenshot.
+- Do NOT assume this is gaming.
+- The stream may be Just Chatting, IRL, cars, cooking, music, reactions, shopping, gaming, sports, stories, tutorials, travel, or anything else.
+- Match the actual topic.
+
+IF turn mode is PROACTIVE_OPENER:
+- You may START a conversation only when you have a specific grounded topic from the current stream image or recent discussion.
+- Give the streamer an easy opening to answer.
+- Good openers are a short specific observation, opinion question, comparison, or playful question about what is actually happening.
+- Never use generic starters like "what's good", "how's everyone doing", "vibes are good", or random hype.
+- If you do not have a specific grounded topic, output exactly SKIP.
+
+IF turn mode is CONVERSATION_FOLLOWUP:
+- Continue the SAME topic naturally.
+- Short streamer answers such as "yeah", "nah", "fr", "I know", or "maybe" can make sense from recent dialogue.
+- Ask at most one natural follow-up question in a message.
+- Do not interrogate the streamer.
+- Usually 2-4 AI turns is enough; let the conversation end naturally.
+- If the topic is over, output exactly SKIP.
+
+IF turn mode is NORMAL_REACTION:
+- Respond to a clear question, joke, strong reaction, interesting statement, reveal, mistake, accomplishment, disagreement, or surprising moment.
+- A normal reaction can naturally turn into a short conversation.
+
+GROUNDING:
+- The screenshot is evidence, not permission to invent.
+- Do not claim an object/event is present unless speech or the screenshot supports it.
+- If context is weak or conflicting, output exactly SKIP.
 
 STYLE:
-- 2-10 words most of the time.
-- Casual stream-chat tone, not polished assistant language.
-- Match the topic naturally. Do not force gaming terms into non-gaming streams.
-- Light slang is okay occasionally: bruh, gang, my boy, twin, ngl, lowkey, fr, cooked, sold, locked in.
+- Most messages: 2-12 words.
+- Usually one short sentence or question.
+- Casual stream-chat tone.
+- Light slang such as bruh, gang, my boy, twin, ngl, lowkey, fr, cooked, sold, locked in is okay occasionally.
 - Most replies should use no slang.
-- Never stack slang.
-- Never use generic filler such as "vibes are solid", "energy is on another level", "ready for action", "ready to roll", "power move", or similar hype-template language.
+- Never stack slang or force trendy wording.
+- Avoid assistant-like wording and generic hype.
 - Never pretend to be a human viewer or claim personal human experiences.
-- Do not repeat or lightly reword recent replies.
-- If you cannot make a SPECIFIC reply tied to what JUST happened or what the streamer JUST said, output exactly SKIP.
+- Do not repeat or lightly reword recent AI replies.
+- Do not force a conversation forever.
 
 Return only the short chat message or exactly SKIP.`
     }];
@@ -573,6 +652,7 @@ Return only the short chat message or exactly SKIP.`
       .slice(0, 450);
 
     if (!reply || reply.toUpperCase() === "SKIP") {
+      if (turnMode === "PROACTIVE_OPENER") scheduleNextProactive();
       return res.json({ action: "skip", reason: "model" });
     }
 
@@ -581,8 +661,26 @@ Return only the short chat message or exactly SKIP.`
     }
 
     if (isGenericBottyReply(reply)) {
+      if (turnMode === "PROACTIVE_OPENER") scheduleNextProactive();
       return res.json({ action: "skip", reason: "generic botty reply blocked" });
     }
+
+    if (turnMode === "PROACTIVE_OPENER") {
+      conversationBotTurns = 1;
+      openConversationWindow();
+      scheduleNextProactive();
+    } else if (turnMode === "CONVERSATION_FOLLOWUP") {
+      conversationBotTurns += 1;
+      openConversationWindow();
+      if (conversationBotTurns >= CONVERSATION_MAX_BOT_TURNS) {
+        conversationActiveUntil = Date.now() + 15000;
+      }
+    } else {
+      conversationBotTurns = 1;
+      openConversationWindow();
+    }
+
+    rememberDialogue("ai", reply);
 
     if (!AUTO_SEND) {
       return res.json({ action: "preview", reply });
