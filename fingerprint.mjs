@@ -1,12 +1,5 @@
 /**
- * fingerprint.mjs — anti-detection / anti-fingerprint layer
- * - Stable, distinct synthetic browser identity per AI account
- * - Realistic browser header sets (Sec-Ch-Ua*, Sec-Fetch-*, Accept-*, Origin)
- * - Optional Chrome TLS/JA3 impersonation via curl-impersonate / curl_cffi
- * - Falls back to Node fetch + spoofed headers if the binary is missing
- *
- * Optional env: ENABLE_FINGERPRINT_SPOOFING, CURL_IMPERSONATE_BIN,
- * CURL_IMPERSONATE (default chrome131), TLS_FETCH_TIMEOUT_MS (default 15000)
+ * fingerprint.mjs — anti-detection / anti-fingerprint layer (v10.4 Optimized)
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -47,7 +40,6 @@ const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q
 const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney"];
 const CHROME_VERSIONS = [124, 125, 126, 127, 128, 129, 130, 131];
 
-/** Stable synthetic browser profile — same account id => same profile every restart. */
 export function buildBrowserProfile(seed) {
   const rng = seededRandom(seed);
   const platform = pick(rng, PLATFORMS);
@@ -89,7 +81,6 @@ export function describeFingerprint(profile) {
   return `Chrome ${profile.chromeMajor} • ${profile.platform} • ${String(profile.acceptLanguage || "").split(",")[0]}`;
 }
 
-/** Browser-like header set for one request. */
 export function browserHeaders(profile, opts = {}) {
   if (!ENABLE_SPOOF || !profile) return {};
   const navigation = Boolean(opts.navigation);
@@ -136,7 +127,6 @@ function resolveCurlBinary() {
   return (curlBinary = "");
 }
 
-/** Human-readable TLS impersonation status (for /api/status and logs). */
 export function tlsImpersonationStatus() {
   resolveCurlBinary();
   return {
@@ -214,11 +204,6 @@ function hostOf(url) {
   try { return new URL(String(url)).hostname; } catch { return ""; }
 }
 
-/**
- * Replacement for raw fetch / node-fetch against Kick.
- * Pass account (fingerprint), options (method/headers/body/agent) and the
- * account's SOCKS5 proxyUrl when configured.
- */
 export async function impersonatedFetch(account, url, options = {}, { proxyUrl = "", profile = null } = {}) {
   const prof = profile || buildBrowserProfile(account?.id || "anon");
   const host = hostOf(url);
@@ -237,8 +222,6 @@ export async function impersonatedFetch(account, url, options = {}, { proxyUrl =
   };
   if (method !== "GET" && method !== "HEAD" && isKick) headers["Origin"] = "https://kick.com";
 
-  // Mutating requests are NEVER auto-retried on a different transport
-  // (that could double-send a chat message). Non-mutating ones may fall back.
   const isMutating = !["GET", "HEAD", "OPTIONS"].includes(method);
 
   const nodePath = (hdrs) => {
@@ -255,7 +238,7 @@ export async function impersonatedFetch(account, url, options = {}, { proxyUrl =
   try {
     return await curlFetch(url, options, headers, proxyUrl);
   } catch (e) {
-    if (isMutating) throw e; // never double-send
+    if (isMutating) throw e;
     return nodePath(headers);
   }
 }
