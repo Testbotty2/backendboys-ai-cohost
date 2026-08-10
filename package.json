@@ -4,8 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm install && node apply-antidetection.mjs",
-    "start": "node server.mjs"
+    "start": "node apply-antidetection.mjs && node server.mjs"
   },
   "dependencies": {
     "dotenv": "17.4.2",
