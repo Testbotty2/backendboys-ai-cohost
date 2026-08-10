@@ -1,4 +1,4 @@
-// apply-antidetection.mjs — Anti-Bot Stealth + Cyberpunk HUD Visual Upgrade
+// apply-antidetection.mjs — Ultra-Human Behavior & Anti-Bot Stealth
 import fs from "node:fs";
 
 const FILE = "server.mjs";
@@ -16,7 +16,7 @@ const patches = [
     guard: `from "./fingerprint.mjs";`
   },
   {
-    name: "2/10 anti-detection config + helpers",
+    name: "2/10 anti-detection config + human physics",
     find: L(
       `if (!SESSION_SECRET) {`,
       `  console.warn("WARNING: SESSION_SECRET is not set.");`,
@@ -27,14 +27,20 @@ const patches = [
       `  console.warn("WARNING: SESSION_SECRET is not set.");`,
       `}`,
       ``,
-      `// ---- Anti-detection / fingerprint spoofing config ----`,
+      `// ---- Ultra-Human Anti-Bot Physics ----`,
       `const ENABLE_FINGERPRINT_SPOOFING = String(process.env.ENABLE_FINGERPRINT_SPOOFING || "true").toLowerCase() !== "false";`,
       `const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLowerCase() !== "false";`,
       `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));`,
+      ``,
       `function humanTypingDelay(content = "", profile = null) {`,
       `  if (!ENABLE_HUMAN_DELAY) return 0;`,
-      `  return calculateHumanTypingDelay(content, profile);`,
+      `  // Base WPM typing delay + cognitive reading pause + attention drift`,
+      `  let base = calculateHumanTypingDelay(content, profile);`,
+      `  // 15% chance human got slightly distracted (adds 1.5s - 3s)`,
+      `  if (Math.random() < 0.15) base += 1500 + Math.floor(Math.random() * 1500);`,
+      `  return base;`,
       `}`,
+      ``,
       `function antidetectionInfo() {`,
       `  return {`,
       `    enabled: ENABLE_FINGERPRINT_SPOOFING,`,
@@ -43,7 +49,7 @@ const patches = [
       `  };`,
       `}`
     ),
-    guard: `const ENABLE_FINGERPRINT_SPOOFING`
+    guard: `// ---- Ultra-Human Anti-Bot Physics ----`
   },
   {
     name: "3/10 per-account browser profile (createAccount base)",
@@ -118,41 +124,16 @@ const patches = [
     find: `    accountCount:aiAccounts.length,maxAccounts:MAX_UI_ACCOUNTS,dispatcher:dispatcherSettings,persistence:persistenceInfo(),isolation:accountIsolationAudit(),`,
     replace: `    accountCount:aiAccounts.length,maxAccounts:MAX_UI_ACCOUNTS,dispatcher:dispatcherSettings,persistence:persistenceInfo(),isolation:accountIsolationAudit(),\n    antidetection:antidetectionInfo(),`,
     guard: `antidetection:antidetectionInfo(),`
-  }
-];
-
-const extraPatches = [
-  {
-    name: "10/12 log fingerprint on account creation",
-    find: `  const account=createAccount(slot,{enabled:false});`,
-    replace: L(
-      `  const account=createAccount(slot,{enabled:false});`,
-      `  logAccount(account,"fingerprint",` + "`Synthetic browser identity: ${describeFingerprint(account.browserProfile)} (TLS: ${tlsImpersonationStatus().available?\"impersonated\":\"header-only fallback\"})`);"
-    ),
-    guard: `logAccount(account,"fingerprint",`
   },
   {
-    name: "11/12 anti-detection status in startup log",
+    name: "10/10 anti-detection status in startup log",
     find: '  console.log(`Dynamic account fleet: ${aiAccounts.length}/${MAX_UI_ACCOUNTS} • persistence: ${persistenceInfo().backend}`);',
     replace: L(
       '  console.log(`Dynamic account fleet: ${aiAccounts.length}/${MAX_UI_ACCOUNTS} • persistence: ${persistenceInfo().backend}`);',
       '  const ad=antidetectionInfo();',
-      '  console.log(`Anti-detection: fingerprint spoofing ${ad.enabled?"ON":"OFF"} • TLS ${ad.tls.available?`impersonated (${ad.tls.binary}, ${ad.tls.impersonate})`:"fallback: headers only — install curl-impersonate for JA3 spoofing"} • human delay ${ad.humanDelayEnabled?"ON":"OFF"}`);'
+      '  console.log(`Anti-detection: fingerprint spoofing ${ad.enabled?"ON":"OFF"} • TLS ${ad.tls.available?`impersonated (${ad.tls.binary}, ${ad.tls.impersonate})`:"fallback: headers only"} • human typing physics ON`);'
     ),
     guard: `Anti-detection: fingerprint spoofing`
-  },
-  {
-    name: "12/12 Live Anti-Bot Indicator Pill in Header",
-    find: `  <div id=\"badge\" class=\"badge\">Loading…</div>\n</header>`,
-    replace: L(
-      `  <div id="badge" class="badge">Loading…</div>`,
-      `  <div id="antiBotHudBadge" style="margin-left:12px;padding:6px 12px;border-radius:999px;background:rgba(0,240,255,0.08);border:1px solid rgba(0,240,255,0.3);font-size:10px;font-weight:900;color:#00f0ff;display:flex;align-items:center;gap:6px;box-shadow:0 0 15px rgba(0,240,255,0.15)">`,
-      `    <span style="width:7px;height:7px;border-radius:50%;background:#00ff66;box-shadow:0 0 10px #00ff66"></span>`,
-      `    <span>🛡️ ANTI-BOT STEALTH ACTIVE</span>`,
-      `  </div>`,
-      `</header>`
-    ),
-    guard: `antiBotHudBadge`
   }
 ];
 
@@ -165,7 +146,7 @@ let src = fs.readFileSync(FILE, "utf8");
 fs.writeFileSync(BACKUP, src);
 
 let applied = 0;
-for (const p of [...patches, ...extraPatches]) {
+for (const p of patches) {
   if (p.guard && src.includes(p.guard)) {
     console.log(`SKIP  ${p.name} (already applied)`);
     continue;
@@ -181,4 +162,4 @@ for (const p of [...patches, ...extraPatches]) {
 }
 
 fs.writeFileSync(FILE, src);
-console.log(`\nDone — ${applied}/12 patches applied.`);
+console.log(`\nDone — ${applied}/10 patches applied.`);
