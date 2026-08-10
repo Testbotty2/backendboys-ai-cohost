@@ -1,8 +1,4 @@
 // apply-antidetection.mjs
-// One-command updater: adds anti-detection / fingerprint spoofing to server.mjs.
-// Usage:  node apply-antidetection.mjs
-// Safe: backs up server.mjs -> server.mjs.bak, only replaces exact matches,
-// skips anything already applied, and reports every change.
 import fs from "node:fs";
 
 const FILE = "server.mjs";
@@ -15,7 +11,7 @@ const patches = [
     find: `import { Pool } from "pg";`,
     replace: L(
       `import { Pool } from "pg";`,
-      `import { buildBrowserProfile, impersonatedFetch, tlsImpersonationStatus, describeFingerprint } from "./fingerprint.mjs";`
+      `import { buildBrowserProfile, impersonatedFetch, tlsImpersonationStatus, describeFingerprint, calculateHumanTypingDelay } from "./fingerprint.mjs";`
     ),
     guard: `from "./fingerprint.mjs";`
   },
@@ -34,18 +30,15 @@ const patches = [
       `// ---- Anti-detection / fingerprint spoofing config ----`,
       `const ENABLE_FINGERPRINT_SPOOFING = String(process.env.ENABLE_FINGERPRINT_SPOOFING || "true").toLowerCase() !== "false";`,
       `const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLowerCase() !== "false";`,
-      `const MIN_HUMAN_DELAY_MS = Number(process.env.MIN_HUMAN_DELAY_MS || 900);`,
-      `const MAX_HUMAN_DELAY_MS = Number(process.env.MAX_HUMAN_DELAY_MS || 2600);`,
       `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));`,
-      `function humanTypingDelay() {`,
+      `function humanTypingDelay(content = "", profile = null) {`,
       `  if (!ENABLE_HUMAN_DELAY) return 0;`,
-      `  return MIN_HUMAN_DELAY_MS + Math.floor(Math.random() * Math.max(1, MAX_HUMAN_DELAY_MS - MIN_HUMAN_DELAY_MS + 1));`,
+      `  return calculateHumanTypingDelay(content, profile);`,
       `}`,
       `function antidetectionInfo() {`,
       `  return {`,
       `    enabled: ENABLE_FINGERPRINT_SPOOFING,`,
       `    humanDelayEnabled: ENABLE_HUMAN_DELAY,`,
-      `    humanDelayMs: [MIN_HUMAN_DELAY_MS, MAX_HUMAN_DELAY_MS],`,
       `    tls: tlsImpersonationStatus()`,
       `  };`,
       `}`
@@ -89,16 +82,16 @@ const patches = [
     ),
     replace: L(
       `  const id=broadcasterId(req); if(!id) throw new Error("Resolve the broadcaster ID first.");`,
-      `  if(source!=="manual" && source!=="test") await sleep(humanTypingDelay());`,
+      `  if(source!=="manual" && source!=="test") await sleep(humanTypingDelay(content, account?.browserProfile));`,
       `  const result=await postKickChat(account,t.access_token,id,content,replyToMessageId);`
     ),
-    guard: `if(source!=="manual" && source!=="test") await sleep(humanTypingDelay());`
+    guard: `if(source!=="manual" && source!=="test") await sleep(humanTypingDelay(`
   },
   {
     name: "7/9 human delay in sendKickIsolated",
     find: `    const t=await refreshAccountTokenServer(account.slot);const result=await postKickChat(account,t.access_token,broadcasterUserId,content,replyToMessageId);`,
-    replace: `    const t=await refreshAccountTokenServer(account.slot);if(source!=="manual")await sleep(humanTypingDelay());const result=await postKickChat(account,t.access_token,broadcasterUserId,content,replyToMessageId);`,
-    guard: `if(source!=="manual")await sleep(humanTypingDelay());`
+    replace: `    const t=await refreshAccountTokenServer(account.slot);if(source!=="manual")await sleep(humanTypingDelay(content, account?.browserProfile));const result=await postKickChat(account,t.access_token,broadcasterUserId,content,replyToMessageId);`,
+    guard: `if(source!=="manual")await sleep(humanTypingDelay(`
   },
   {
     name: "8/9 expose fingerprint in publicAccount",
@@ -110,6 +103,7 @@ const patches = [
       `      userAgent: account.browserProfile.userAgent,`,
       `      platform: account.browserProfile.platform,`,
       `      chromeMajor: account.browserProfile.chromeMajor,`,
+      `      typingWpm: account.browserProfile.typingWpm,`,
       `      acceptLanguage: account.browserProfile.acceptLanguage,`,
       `      secChUa: account.browserProfile.secChUa,`,
       `      screen: account.browserProfile.screen,`,
@@ -127,8 +121,6 @@ const patches = [
   }
 ];
 
-// Patch 10 & 11 are applied separately (they have find strings that must not
-// collide with patch 9's guard).
 const extraPatches = [
   {
     name: "10/11 log fingerprint on account creation",
@@ -158,7 +150,6 @@ if (!fs.existsSync(FILE)) {
 
 let src = fs.readFileSync(FILE, "utf8");
 fs.writeFileSync(BACKUP, src);
-console.log(`Backup written: ${BACKUP}\n`);
 
 let applied = 0;
 for (const p of [...patches, ...extraPatches]) {
@@ -178,8 +169,3 @@ for (const p of [...patches, ...extraPatches]) {
 
 fs.writeFileSync(FILE, src);
 console.log(`\nDone — ${applied}/11 patches applied.`);
-if (!fs.existsSync("fingerprint.mjs")) {
-  console.log("NOTE: fingerprint.mjs is missing — save it from the code block below.");
-} else {
-  console.log("fingerprint.mjs present. Restart the server and check the startup log.");
-}
