@@ -1,10 +1,10 @@
 {
   "name": "juniors-ai-chat",
-  "version": "10.4.0",
+  "version": "10.5.0",
   "private": true,
   "type": "module",
-    "scripts": {
-    "build": "node apply-antidetection.mjs",
+  "scripts": {
+    "build": "pip install curl_cffi || true && node apply-antidetection.mjs",
     "start": "node server.mjs"
   },
   "dependencies": {
