@@ -1,5 +1,5 @@
 /**
- * fingerprint.mjs — anti-detection / anti-fingerprint layer (v10.4 Optimized)
+ * fingerprint.mjs — Anti-detection & Human Physics Layer (v10.5 Ultra)
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -13,6 +13,7 @@ const CURL_BIN = String(process.env.CURL_IMPERSONATE_BIN || "").trim();
 const CURL_IMPERSONATE = String(process.env.CURL_IMPERSONATE || "chrome131");
 const TLS_TIMEOUT_MS = Number(process.env.TLS_FETCH_TIMEOUT_MS || 15000);
 
+// ---------- Deterministic Seeded Randomness ----------
 function seededRandom(seedStr) {
   const s = String(seedStr || "default");
   let h = 1779033703 ^ s.length;
@@ -38,8 +39,9 @@ const PLATFORMS = [
 ];
 const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q=0.8", "en-GB,en;q=0.9"];
 const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney"];
-const CHROME_VERSIONS = [124, 125, 126, 127, 128, 129, 130, 131];
+const CHROME_VERSIONS = [125, 126, 127, 128, 129, 130, 131];
 
+/** Build a stable synthetic browser profile per account ID */
 export function buildBrowserProfile(seed) {
   const rng = seededRandom(seed);
   const platform = pick(rng, PLATFORMS);
@@ -58,9 +60,10 @@ export function buildBrowserProfile(seed) {
 
   const secChUa = major >= 131
     ? `"Not(A:Brand";v="24", "Chromium";v="${major}", "Google Chrome";v="${major}"`
-    : major >= 129
-      ? `"Chromium";v="${major}", "Not_A Brand";v="24", "Google Chrome";v="${major}"`
-      : `"Not_A Brand";v="24", "Chromium";v="${major}", "Google Chrome";v="${major}"`;
+    : `"Chromium";v="${major}", "Not_A Brand";v="24", "Google Chrome";v="${major}"`;
+
+  // WPM typing profile: fast (65-80 WPM), average (45-65 WPM), or casual (30-45 WPM)
+  const typingWpm = Math.floor(35 + rng() * 45);
 
   return {
     key: String(seed),
@@ -72,19 +75,69 @@ export function buildBrowserProfile(seed) {
     acceptLanguage: pick(rng, LANGS),
     screen: platform.screen,
     timezone: pick(rng, TIMEZONES),
+    typingWpm,
     doNotTrack: rng() < 0.12 ? "1" : "unspecified"
   };
 }
 
 export function describeFingerprint(profile) {
   if (!profile) return "no fingerprint";
-  return `Chrome ${profile.chromeMajor} • ${profile.platform} • ${String(profile.acceptLanguage || "").split(",")[0]}`;
+  return `Chrome ${profile.chromeMajor} • ${profile.platform} • ${profile.typingWpm} WPM`;
 }
 
+// ---------- Human Typing Physics Model ----------
+/**
+ * Calculates realistic human delay based on message length and typing speed (WPM)
+ * + initial reaction pause + keypress variation.
+ */
+export function calculateHumanTypingDelay(message = "", profile = null) {
+  const text = String(message || "").trim();
+  const wpm = profile?.typingWpm || 55; // default ~55 WPM
+  const msPerChar = (60000 / (wpm * 5)); // ~5 chars per word
+
+  // 1. Thinking / reading pause (400ms - 1200ms)
+  const thinkingPause = 400 + Math.random() * 800;
+
+  // 2. Typing duration based on character count
+  const typingTime = text.length * msPerChar;
+
+  // 3. Gaussian-like human variance (±20%)
+  const jitter = (Math.random() - 0.5) * (typingTime * 0.4);
+
+  const totalDelay = Math.round(thinkingPause + typingTime + jitter);
+  return Math.max(700, Math.min( totalDelay, 8500 )); // clamp between 0.7s and 8.5s
+}
+
+// ---------- Natural Human Chat Formatter ----------
+/**
+ * Strips unnatural AI traits (like trailing periods or corporate capitalization)
+ * to match live Kick chat style.
+ */
+export function humanizeChatFormatting(message = "") {
+  let s = String(message || "").trim();
+  if (!s) return "";
+
+  // 1. Remove rigid trailing period if line is short (under 15 words)
+  if (s.endsWith(".") && !s.endsWith("...") && s.split(" ").length < 15) {
+    s = s.slice(0, -1);
+  }
+
+  // 2. 75% chance to lowercase first letter if starting sentence looks formal
+  if (Math.random() < 0.75 && /^[A-Z][a-z]/.test(s) && !s.startsWith("I ")) {
+    s = s.charAt(0).toLowerCase() + s.slice(1);
+  }
+
+  // 3. Replace multiple spaces/newlines with single space
+  s = s.replace(/\s+/g, " ");
+
+  return s;
+}
+
+// ---------- Header Generation ----------
 export function browserHeaders(profile, opts = {}) {
   if (!ENABLE_SPOOF || !profile) return {};
   const navigation = Boolean(opts.navigation);
-  const h = {
+  return {
     "User-Agent": profile.userAgent,
     "Accept": navigation
       ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
@@ -97,13 +150,9 @@ export function browserHeaders(profile, opts = {}) {
     "Sec-Fetch-Mode": navigation ? "navigate" : "cors",
     "Sec-Fetch-Site": opts.site || "none"
   };
-  if (navigation) {
-    h["Sec-Fetch-User"] = "?1";
-    h["Upgrade-Insecure-Requests"] = "1";
-  }
-  return h;
 }
 
+// ---------- TLS Impersonation ----------
 let curlBinary = null;
 let curlProbeError = "";
 
@@ -111,10 +160,9 @@ function resolveCurlBinary() {
   if (curlBinary !== null) return curlBinary;
   if (CURL_BIN) {
     if (fs.existsSync(CURL_BIN)) return (curlBinary = CURL_BIN);
-    curlProbeError = `CURL_IMPERSONATE_BIN not found: ${CURL_BIN}`;
     return (curlBinary = "");
   }
-  const candidates = ["curl_cffi", "curl-impersonate", "curl_chrome131", "curl_chrome124", "curl_chrome116"];
+  const candidates = ["curl_cffi", "curl-impersonate", "curl_chrome131", "curl_chrome124"];
   for (const bin of candidates) {
     try { fs.accessSync(bin, fs.constants.X_OK); return (curlBinary = bin); } catch {}
     for (const dir of String(process.env.PATH || "").split(path.delimiter)) {
@@ -123,7 +171,6 @@ function resolveCurlBinary() {
       try { fs.accessSync(full, fs.constants.X_OK); return (curlBinary = full); } catch {}
     }
   }
-  curlProbeError = "curl-impersonate / curl_cffi binary not found — using Node fetch fallback with spoofed headers";
   return (curlBinary = "");
 }
 
@@ -135,7 +182,7 @@ export function tlsImpersonationStatus() {
     binary: curlBinary || "",
     impersonate: CURL_IMPERSONATE,
     timeoutMs: TLS_TIMEOUT_MS,
-    error: curlBinary ? "" : curlProbeError
+    error: curlBinary ? "" : "curl-impersonate / curl_cffi binary not found — using header-only fallback"
   };
 }
 
@@ -168,13 +215,10 @@ function responseLike(status, body) {
   return {
     status: Number(status || 0),
     ok: Number(status || 0) >= 200 && Number(status || 0) < 300,
-    statusText: "",
-    headers: {},
     text: async () => buf.toString("utf8"),
     json: async () => {
       try { return JSON.parse(buf.toString("utf8") || "{}"); } catch { return {}; }
-    },
-    arrayBuffer: async () => buf
+    }
   };
 }
 
@@ -200,13 +244,9 @@ async function curlFetch(url, options, headers, proxyUrl) {
   }
 }
 
-function hostOf(url) {
-  try { return new URL(String(url)).hostname; } catch { return ""; }
-}
-
 export async function impersonatedFetch(account, url, options = {}, { proxyUrl = "", profile = null } = {}) {
   const prof = profile || buildBrowserProfile(account?.id || "anon");
-  const host = hostOf(url);
+  const host = (()=>{ try{ return new URL(String(url)).hostname; }catch{ return ""; } })();
   const isKick = /(^|\.)kick\.com$/i.test(host);
   const site = isKick ? "same-site" : "cross-site";
   const method = String(options.method || "GET").toUpperCase();
