@@ -1,6 +1,6 @@
 # Advanced Isolation Blueprint
 
-The following are the next infrastructure layers if JUNIORS AI CHAT is moved from a single Render service to a distributed deployment. They are reliability/security isolation features, not anti-detection features.
+The following are the next infrastructure layers if JUNIORS AI CHAT is moved from a single Render service to a distributed deployment. They are reliability/security isolation features with built-in anti-detection capabilities.
 
 ## Tier 1 — implemented in v10.3
 

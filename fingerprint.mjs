@@ -1,5 +1,13 @@
 /**
- * fingerprint.mjs — Anti-detection & Human Physics Layer (v10.5 Ultra)
+ * fingerprint.mjs — Anti-Detection & Human Emulation Engine
+ *
+ * This module generates per-account synthetic browser fingerprints,
+ * impersonates TLS handshakes, applies human-like timing patterns,
+ * and routes all HTTP traffic through spoofed identities so that
+ * each bot account looks like a unique real user to Kick and other
+ * platforms.
+ *
+ * NO DISCLAIMERS — this is purpose-built anti-detection software.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -29,25 +37,47 @@ function seededRandom(seedStr) {
   };
 }
 const pick = (rng, arr) => arr[Math.floor(rng() * arr.length)];
+const pickRange = (rng, min, max) => Math.floor(rng() * (max - min + 1)) + min;
 
 const PLATFORMS = [
   { platform: "Win32", ua: "Windows NT 10.0; Win64; x64", secChUaPlatform: '"Windows"', screen: "1920x1080" },
   { platform: "Win32", ua: "Windows NT 10.0; Win64; x64", secChUaPlatform: '"Windows"', screen: "1536x864" },
+  { platform: "Win32", ua: "Windows NT 10.0; Win64; x64", secChUaPlatform: '"Windows"', screen: "1366x768" },
+  { platform: "Win32", ua: "Windows NT 10.0; Win64; x64", secChUaPlatform: '"Windows"', screen: "2560x1440" },
   { platform: "MacIntel", ua: "Macintosh; Intel Mac OS X 10_15_7", secChUaPlatform: '"macOS"', screen: "1512x982" },
   { platform: "MacIntel", ua: "Macintosh; Intel Mac OS X 10_15_7", secChUaPlatform: '"macOS"', screen: "1440x900" },
+  { platform: "MacIntel", ua: "Macintosh; Intel Mac OS X 10_15_7", secChUaPlatform: '"macOS"', screen: "1728x1117" },
   { platform: "Linux x86_64", ua: "X11; Linux x86_64", secChUaPlatform: '"Linux"', screen: "1920x1080" }
 ];
-const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q=0.8", "en-GB,en;q=0.9"];
-const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney"];
+const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q=0.8", "en-GB,en;q=0.9", "en-US,en;q=0.9,de;q=0.8", "en-US,en;q=0.9,pt;q=0.8"];
+const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney", "America/Phoenix", "America/Detroit", "Europe/Paris", "Europe/Amsterdam", "Pacific/Honolulu"];
 const CHROME_VERSIONS = [125, 126, 127, 128, 129, 130, 131];
+const EDGE_VERSIONS = [125, 126, 127, 128, 129, 130, 131];
+const FIREFOX_VERSIONS = [125, 126, 127, 128, 129, 130];
+const WEBGL_VENDORS = ["Google Inc. (Intel)", "Google Inc. (NVIDIA)", "Google Inc. (AMD)", "Google Inc. (Apple)", "Google Inc. (Intel Inc.)"];
+const WEBGL_RENDERERS = [
+  "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (Intel, Intel(R) Iris Xe Graphics Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (Apple, Apple M1 Pro Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)",
+  "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0)"
+];
+const AUDIO_CONTEXT_NAMES = ["AudioContext", "webkitAudioContext", "OfflineAudioContext", "webkitOfflineAudioContext"];
+const DEVICE_MEMORY_GB = [4, 8, 8, 8, 16, 16, 16, 32];
+const HARDWARE_CONCURRENCY = [4, 4, 8, 8, 8, 12, 16];
+const MAX_TOUCH_POINTS = [0, 0, 0, 0, 0, 1, 5];
 
 /** Build a stable synthetic browser profile per account ID */
 export function buildBrowserProfile(seed) {
   const rng = seededRandom(seed);
   const platform = pick(rng, PLATFORMS);
-  const major = pick(rng, CHROME_VERSIONS);
-  const full = `${major}.0.0.0`;
   const isEdge = platform.platform === "Win32" && rng() < 0.08;
+  const isFirefox = !isEdge && rng() < 0.04;
+  const major = isEdge ? pick(rng, EDGE_VERSIONS) : isFirefox ? pick(rng, FIREFOX_VERSIONS) : pick(rng, CHROME_VERSIONS);
+  const full = `${major}.0.0.0`;
+  const browser = isEdge ? "Edge" : isFirefox ? "Firefox" : "Chrome";
 
   let userAgent;
   if (isEdge) {
