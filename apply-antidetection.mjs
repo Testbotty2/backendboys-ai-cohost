@@ -1,4 +1,4 @@
-// apply-antidetection.mjs — Anti-Bot Stealth + Per-Account Webhook Subscriptions
+// apply-antidetection.mjs — Anti-Bot Stealth + Cyberpunk HUD Visual Upgrade
 import fs from "node:fs";
 
 const FILE = "server.mjs";
@@ -7,7 +7,7 @@ const L = (...lines) => lines.join("\n");
 
 const patches = [
   {
-    name: "1/11 import fingerprint module",
+    name: "1/10 import fingerprint module",
     find: `import { Pool } from "pg";`,
     replace: L(
       `import { Pool } from "pg";`,
@@ -16,7 +16,7 @@ const patches = [
     guard: `from "./fingerprint.mjs";`
   },
   {
-    name: "2/11 anti-detection config + human physics",
+    name: "2/10 anti-detection config + helpers",
     find: L(
       `if (!SESSION_SECRET) {`,
       `  console.warn("WARNING: SESSION_SECRET is not set.");`,
@@ -27,18 +27,14 @@ const patches = [
       `  console.warn("WARNING: SESSION_SECRET is not set.");`,
       `}`,
       ``,
-      `// ---- Ultra-Human Anti-Bot Physics ----`,
+      `// ---- Anti-detection / fingerprint spoofing config ----`,
       `const ENABLE_FINGERPRINT_SPOOFING = String(process.env.ENABLE_FINGERPRINT_SPOOFING || "true").toLowerCase() !== "false";`,
       `const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLowerCase() !== "false";`,
       `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));`,
-      ``,
       `function humanTypingDelay(content = "", profile = null) {`,
       `  if (!ENABLE_HUMAN_DELAY) return 0;`,
-      `  let base = calculateHumanTypingDelay(content, profile);`,
-      `  if (Math.random() < 0.15) base += 1500 + Math.floor(Math.random() * 1500);`,
-      `  return base;`,
+      `  return calculateHumanTypingDelay(content, profile);`,
       `}`,
-      ``,
       `function antidetectionInfo() {`,
       `  return {`,
       `    enabled: ENABLE_FINGERPRINT_SPOOFING,`,
@@ -47,22 +43,22 @@ const patches = [
       `  };`,
       `}`
     ),
-    guard: `// ---- Ultra-Human Anti-Bot Physics ----`
+    guard: `const ENABLE_FINGERPRINT_SPOOFING`
   },
   {
-    name: "3/11 per-account browser profile (createAccount base)",
+    name: "3/10 per-account browser profile (createAccount base)",
     find: '    id,sessionNamespace:String(overrides.sessionNamespace||`acct_${safeNamespaceId(id)}`),createdAt:Number(overrides.createdAt||Date.now()),updatedAt:Number(overrides.updatedAt||Date.now()),',
     replace: '    id,sessionNamespace:String(overrides.sessionNamespace||`acct_${safeNamespaceId(id)}`),createdAt:Number(overrides.createdAt||Date.now()),updatedAt:Number(overrides.updatedAt||Date.now()),\n    browserProfile:buildBrowserProfile(id),',
     guard: `browserProfile:buildBrowserProfile(id),`
   },
   {
-    name: "4/11 keep profile on restore",
+    name: "4/10 keep profile on restore",
     find: `  merged.sessionNamespace=String(overrides.sessionNamespace||base.sessionNamespace);`,
     replace: `  merged.sessionNamespace=String(overrides.sessionNamespace||base.sessionNamespace);\n  merged.browserProfile = merged.browserProfile || buildBrowserProfile(merged.id);`,
     guard: `merged.browserProfile = merged.browserProfile || buildBrowserProfile(merged.id);`
   },
   {
-    name: "5/11 route all Kick fetches through impersonatedFetch",
+    name: "5/10 route all Kick fetches through impersonatedFetch",
     find: L(
       `  const agent=proxyAgentForAccount(account);`,
       `  try{`,
@@ -79,7 +75,7 @@ const patches = [
     guard: `await impersonatedFetch(account,url`
   },
   {
-    name: "6/11 human delay in sendKick",
+    name: "6/10 human delay in sendKick",
     find: L(
       `  const id=broadcasterId(req); if(!id) throw new Error("Resolve the broadcaster ID first.");`,
       `  const result=await postKickChat(account,t.access_token,id,content,replyToMessageId);`
@@ -92,13 +88,13 @@ const patches = [
     guard: `if(source!=="manual" && source!=="test") await sleep(humanTypingDelay(`
   },
   {
-    name: "7/11 human delay in sendKickIsolated",
+    name: "7/10 human delay in sendKickIsolated",
     find: `    const t=await refreshAccountTokenServer(account.slot);const result=await postKickChat(account,t.access_token,broadcasterUserId,content,replyToMessageId);`,
     replace: `    const t=await refreshAccountTokenServer(account.slot);if(source!=="manual")await sleep(humanTypingDelay(content, account?.browserProfile));const result=await postKickChat(account,t.access_token,broadcasterUserId,content,replyToMessageId);`,
     guard: `if(source!=="manual")await sleep(humanTypingDelay(`
   },
   {
-    name: "8/11 expose fingerprint in publicAccount",
+    name: "8/10 expose fingerprint in publicAccount",
     find: `    badgeState:badgeStateForAccount(account),`,
     replace: L(
       `    badgeState:badgeStateForAccount(account),`,
@@ -118,50 +114,45 @@ const patches = [
     guard: `fingerprint: account.browserProfile ? {`
   },
   {
-    name: "9/11 status endpoint + startup log",
+    name: "9/10 status endpoint + startup log",
     find: `    accountCount:aiAccounts.length,maxAccounts:MAX_UI_ACCOUNTS,dispatcher:dispatcherSettings,persistence:persistenceInfo(),isolation:accountIsolationAudit(),`,
     replace: `    accountCount:aiAccounts.length,maxAccounts:MAX_UI_ACCOUNTS,dispatcher:dispatcherSettings,persistence:persistenceInfo(),isolation:accountIsolationAudit(),\n    antidetection:antidetectionInfo(),`,
     guard: `antidetection:antidetectionInfo(),`
+  }
+];
+
+const extraPatches = [
+  {
+    name: "10/12 log fingerprint on account creation",
+    find: `  const account=createAccount(slot,{enabled:false});`,
+    replace: L(
+      `  const account=createAccount(slot,{enabled:false});`,
+      `  logAccount(account,"fingerprint",` + "`Synthetic browser identity: ${describeFingerprint(account.browserProfile)} (TLS: ${tlsImpersonationStatus().available?\"impersonated\":\"header-only fallback\"})`);"
+    ),
+    guard: `logAccount(account,"fingerprint",`
   },
   {
-    name: "10/11 anti-detection status in startup log",
+    name: "11/12 anti-detection status in startup log",
     find: '  console.log(`Dynamic account fleet: ${aiAccounts.length}/${MAX_UI_ACCOUNTS} • persistence: ${persistenceInfo().backend}`);',
     replace: L(
       '  console.log(`Dynamic account fleet: ${aiAccounts.length}/${MAX_UI_ACCOUNTS} • persistence: ${persistenceInfo().backend}`);',
       '  const ad=antidetectionInfo();',
-      '  console.log(`Anti-detection: fingerprint spoofing ${ad.enabled?"ON":"OFF"} • TLS ${ad.tls.available?`impersonated (${ad.tls.binary}, ${ad.tls.impersonate})`:"fallback: headers only"} • human typing physics ON`);'
+      '  console.log(`Anti-detection: fingerprint spoofing ${ad.enabled?"ON":"OFF"} • TLS ${ad.tls.available?`impersonated (${ad.tls.binary}, ${ad.tls.impersonate})`:"fallback: headers only — install curl-impersonate for JA3 spoofing"} • human delay ${ad.humanDelayEnabled?"ON":"OFF"}`);'
     ),
     guard: `Anti-detection: fingerprint spoofing`
   },
   {
-    name: "11/11 Add per-account webhook subscription API route",
-    find: `app.post("/api/chat/subscribe",async(req,res)=>{try{syncServerAuthFromRequest(req);const id=broadcasterId(req);if(!id)throw new Error("Resolve broadcaster ID first.");res.json({ok:true,...await ensureChatSubscription(id)});}catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}});`,
+    name: "12/12 Live Anti-Bot Indicator Pill in Header",
+    find: `  <div id=\"badge\" class=\"badge\">Loading…</div>\n</header>`,
     replace: L(
-      `app.post("/api/chat/subscribe",async(req,res)=>{try{syncServerAuthFromRequest(req);const id=broadcasterId(req);if(!id)throw new Error("Resolve broadcaster ID first.");res.json({ok:true,...await ensureChatSubscription(id)});}catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}});`,
-      ``,
-      `app.post("/api/accounts/subscribe-chat",async(req,res)=>{`,
-      `  try{`,
-      `    syncServerAuthFromRequest(req);`,
-      `    const slot=validSlot(req.body?.slot);`,
-      `    if(!slot)throw new Error("Choose a valid account slot.");`,
-      `    const account=accountBySlot(slot);`,
-      `    if(!account?.token?.access_token)throw new Error(\`Account \${slot} is not connected.\`);`,
-      `    const broadcasterIdNum=Number(serverBroadcasterId||broadcasterId(req)||process.env.KICK_BROADCASTER_USER_ID||0);`,
-      `    if(!broadcasterIdNum)throw new Error("Resolve the broadcaster channel slug first under Stream + Chat.");`,
-      `    const t=await refreshAccountTokenServer(account.slot);`,
-      `    const r=await fetchForAccount(account,\"https://api.kick.com/public/v1/events/subscriptions\",{`,
-      `      method:\"POST\",`,
-      `      headers:{Authorization:\`Bearer \${t.access_token}\",\"Content-Type\":\"application/json\",Accept:\"application/json\"},`,
-      `      body:JSON.stringify({broadcaster_user_id:broadcasterIdNum,events:[{name:\"chat.message.sent\",version:1}],method:\"webhook\"})`,
-      `    });`,
-      `    const data=await r.json().catch(()=>({}));`,
-      `    if(!r.ok&&!/already/i.test(JSON.stringify(data)))throw new Error(\`Account \${slot} webhook subscription failed (\${r.status}): \${JSON.stringify(data)}\`);`,
-      `    logAccount(account,\"webhook\",\`Account \${slot} registered its own Kick webhook subscription ✅\`);`,
-      `    res.json({ok:true,slot,subscribed:true});`,
-      `  }catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}`,
-      `});`
+      `  <div id="badge" class="badge">Loading…</div>`,
+      `  <div id="antiBotHudBadge" style="margin-left:12px;padding:6px 12px;border-radius:999px;background:rgba(0,240,255,0.08);border:1px solid rgba(0,240,255,0.3);font-size:10px;font-weight:900;color:#00f0ff;display:flex;align-items:center;gap:6px;box-shadow:0 0 15px rgba(0,240,255,0.15)">`,
+      `    <span style="width:7px;height:7px;border-radius:50%;background:#00ff66;box-shadow:0 0 10px #00ff66"></span>`,
+      `    <span>🛡️ ANTI-BOT STEALTH ACTIVE</span>`,
+      `  </div>`,
+      `</header>`
     ),
-    guard: `/api/accounts/subscribe-chat`
+    guard: `antiBotHudBadge`
   }
 ];
 
@@ -174,7 +165,7 @@ let src = fs.readFileSync(FILE, "utf8");
 fs.writeFileSync(BACKUP, src);
 
 let applied = 0;
-for (const p of patches) {
+for (const p of [...patches, ...extraPatches]) {
   if (p.guard && src.includes(p.guard)) {
     console.log(`SKIP  ${p.name} (already applied)`);
     continue;
@@ -190,4 +181,4 @@ for (const p of patches) {
 }
 
 fs.writeFileSync(FILE, src);
-console.log(`\nDone — ${applied}/11 patches applied.`);
+console.log(`\nDone — ${applied}/12 patches applied.`);
