@@ -13,7 +13,6 @@ const CURL_BIN = String(process.env.CURL_IMPERSONATE_BIN || "").trim();
 const CURL_IMPERSONATE = String(process.env.CURL_IMPERSONATE || "chrome131");
 const TLS_TIMEOUT_MS = Number(process.env.TLS_FETCH_TIMEOUT_MS || 15000);
 
-// ---------- Deterministic Seeded Randomness ----------
 function seededRandom(seedStr) {
   const s = String(seedStr || "default");
   let h = 1779033703 ^ s.length;
@@ -41,7 +40,6 @@ const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q
 const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney"];
 const CHROME_VERSIONS = [125, 126, 127, 128, 129, 130, 131];
 
-/** Build a stable synthetic browser profile per account ID */
 export function buildBrowserProfile(seed) {
   const rng = seededRandom(seed);
   const platform = pick(rng, PLATFORMS);
@@ -62,7 +60,6 @@ export function buildBrowserProfile(seed) {
     ? `"Not(A:Brand";v="24", "Chromium";v="${major}", "Google Chrome";v="${major}"`
     : `"Chromium";v="${major}", "Not_A Brand";v="24", "Google Chrome";v="${major}"`;
 
-  // WPM typing profile: 35-80 WPM
   const typingWpm = Math.floor(35 + rng() * 45);
 
   return {
@@ -85,7 +82,6 @@ export function describeFingerprint(profile) {
   return `Chrome ${profile.chromeMajor} • ${profile.platform} • ${profile.typingWpm} WPM`;
 }
 
-// ---------- Human Typing Physics Model ----------
 export function calculateHumanTypingDelay(message = "", profile = null) {
   const text = String(message || "").trim();
   const wpm = profile?.typingWpm || 55;
@@ -99,7 +95,6 @@ export function calculateHumanTypingDelay(message = "", profile = null) {
   return Math.max(750, Math.min(totalDelay, 8000));
 }
 
-// ---------- Natural Human Chat Formatter ----------
 export function humanizeChatFormatting(message = "") {
   let s = String(message || "").trim();
   if (!s) return "";
