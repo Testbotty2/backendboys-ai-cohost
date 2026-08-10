@@ -13,6 +13,7 @@ const CURL_BIN = String(process.env.CURL_IMPERSONATE_BIN || "").trim();
 const CURL_IMPERSONATE = String(process.env.CURL_IMPERSONATE || "chrome131");
 const TLS_TIMEOUT_MS = Number(process.env.TLS_FETCH_TIMEOUT_MS || 15000);
 
+// ---------- Deterministic Seeded Randomness ----------
 function seededRandom(seedStr) {
   const s = String(seedStr || "default");
   let h = 1779033703 ^ s.length;
@@ -40,6 +41,7 @@ const LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q
 const TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "Europe/London", "Europe/Berlin", "Australia/Sydney"];
 const CHROME_VERSIONS = [125, 126, 127, 128, 129, 130, 131];
 
+/** Build a stable synthetic browser profile per account ID */
 export function buildBrowserProfile(seed) {
   const rng = seededRandom(seed);
   const platform = pick(rng, PLATFORMS);
@@ -60,6 +62,7 @@ export function buildBrowserProfile(seed) {
     ? `"Not(A:Brand";v="24", "Chromium";v="${major}", "Google Chrome";v="${major}"`
     : `"Chromium";v="${major}", "Not_A Brand";v="24", "Google Chrome";v="${major}"`;
 
+  // WPM typing profile: fast (65-80 WPM), average (45-65 WPM), or casual (30-45 WPM)
   const typingWpm = Math.floor(35 + rng() * 45);
 
   return {
@@ -82,34 +85,55 @@ export function describeFingerprint(profile) {
   return `Chrome ${profile.chromeMajor} • ${profile.platform} • ${profile.typingWpm} WPM`;
 }
 
+// ---------- Human Typing Physics Model ----------
+/**
+ * Calculates realistic human delay based on message length and typing speed (WPM)
+ * + initial reaction pause + keypress variation.
+ */
 export function calculateHumanTypingDelay(message = "", profile = null) {
   const text = String(message || "").trim();
-  const wpm = profile?.typingWpm || 55;
-  const msPerChar = (60000 / (wpm * 5));
+  const wpm = profile?.typingWpm || 55; // default ~55 WPM
+  const msPerChar = (60000 / (wpm * 5)); // ~5 chars per word
 
-  const thinkingPause = 400 + Math.random() * 700;
+  // 1. Thinking / reading pause (400ms - 1200ms)
+  const thinkingPause = 400 + Math.random() * 800;
+
+  // 2. Typing duration based on character count
   const typingTime = text.length * msPerChar;
+
+  // 3. Gaussian-like human variance (±20%)
   const jitter = (Math.random() - 0.5) * (typingTime * 0.4);
 
   const totalDelay = Math.round(thinkingPause + typingTime + jitter);
-  return Math.max(750, Math.min(totalDelay, 8000));
+  return Math.max(700, Math.min( totalDelay, 8500 )); // clamp between 0.7s and 8.5s
 }
 
+// ---------- Natural Human Chat Formatter ----------
+/**
+ * Strips unnatural AI traits (like trailing periods or corporate capitalization)
+ * to match live Kick chat style.
+ */
 export function humanizeChatFormatting(message = "") {
   let s = String(message || "").trim();
   if (!s) return "";
 
-  if (s.endsWith(".") && !s.endsWith("...") && s.split(" ").length < 14) {
+  // 1. Remove rigid trailing period if line is short (under 15 words)
+  if (s.endsWith(".") && !s.endsWith("...") && s.split(" ").length < 15) {
     s = s.slice(0, -1);
   }
 
+  // 2. 75% chance to lowercase first letter if starting sentence looks formal
   if (Math.random() < 0.75 && /^[A-Z][a-z]/.test(s) && !s.startsWith("I ")) {
     s = s.charAt(0).toLowerCase() + s.slice(1);
   }
 
-  return s.replace(/\s+/g, " ");
+  // 3. Replace multiple spaces/newlines with single space
+  s = s.replace(/\s+/g, " ");
+
+  return s;
 }
 
+// ---------- Header Generation ----------
 export function browserHeaders(profile, opts = {}) {
   if (!ENABLE_SPOOF || !profile) return {};
   const navigation = Boolean(opts.navigation);
@@ -128,6 +152,7 @@ export function browserHeaders(profile, opts = {}) {
   };
 }
 
+// ---------- TLS Impersonation ----------
 let curlBinary = null;
 let curlProbeError = "";
 
