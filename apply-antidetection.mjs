@@ -139,7 +139,7 @@ const patches = [
     guard: `Anti-detection: fingerprint spoofing`
   },
   {
-    name: "12/12 Cyberpunk HUD Theme CSS Injection",
+    name: "12/12 Cyberpunk HUD Visual Upgrade",
     find: `@media(max-width:700px){.isolationSummary{grid-template-columns:1fr}.accountQuickStats{grid-template-columns:repeat(2,minmax(0,1fr))!important}}\n\n</style>`,
     replace: L(
       `@media(max-width:700px){.isolationSummary{grid-template-columns:1fr}.accountQuickStats{grid-template-columns:repeat(2,minmax(0,1fr))!important}}`,
