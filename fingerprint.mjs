@@ -62,7 +62,7 @@ export function buildBrowserProfile(seed) {
     ? `"Not(A:Brand";v="24", "Chromium";v="${major}", "Google Chrome";v="${major}"`
     : `"Chromium";v="${major}", "Not_A Brand";v="24", "Google Chrome";v="${major}"`;
 
-  // WPM typing profile: fast (65-80 WPM), average (45-65 WPM), or casual (35-45 WPM)
+  // WPM typing profile: 35-80 WPM
   const typingWpm = Math.floor(35 + rng() * 45);
 
   return {
@@ -86,54 +86,35 @@ export function describeFingerprint(profile) {
 }
 
 // ---------- Human Typing Physics Model ----------
-/**
- * Calculates realistic human delay based on message length and typing speed (WPM)
- * + initial reaction pause + keypress variation.
- */
 export function calculateHumanTypingDelay(message = "", profile = null) {
   const text = String(message || "").trim();
-  const wpm = profile?.typingWpm || 55; // default ~55 WPM
-  const msPerChar = (60000 / (wpm * 5)); // ~5 chars per word
+  const wpm = profile?.typingWpm || 55;
+  const msPerChar = (60000 / (wpm * 5));
 
-  // 1. Thinking / reading pause (400ms - 1100ms)
   const thinkingPause = 400 + Math.random() * 700;
-
-  // 2. Typing duration based on character count
   const typingTime = text.length * msPerChar;
-
-  // 3. Human keypress variance (±20%)
   const jitter = (Math.random() - 0.5) * (typingTime * 0.4);
 
   const totalDelay = Math.round(thinkingPause + typingTime + jitter);
-  return Math.max(750, Math.min(totalDelay, 8000)); // clamp between 0.75s and 8.0s
+  return Math.max(750, Math.min(totalDelay, 8000));
 }
 
 // ---------- Natural Human Chat Formatter ----------
-/**
- * Strips unnatural AI traits (like trailing periods or corporate capitalization)
- * to match live Kick chat style.
- */
 export function humanizeChatFormatting(message = "") {
   let s = String(message || "").trim();
   if (!s) return "";
 
-  // 1. Remove rigid trailing period if line is short (under 14 words)
   if (s.endsWith(".") && !s.endsWith("...") && s.split(" ").length < 14) {
     s = s.slice(0, -1);
   }
 
-  // 2. 75% chance to lowercase first letter if starting sentence looks formal
   if (Math.random() < 0.75 && /^[A-Z][a-z]/.test(s) && !s.startsWith("I ")) {
     s = s.charAt(0).toLowerCase() + s.slice(1);
   }
 
-  // 3. Replace multiple spaces/newlines with single space
-  s = s.replace(/\s+/g, " ");
-
-  return s;
+  return s.replace(/\s+/g, " ");
 }
 
-// ---------- Header Generation ----------
 export function browserHeaders(profile, opts = {}) {
   if (!ENABLE_SPOOF || !profile) return {};
   const navigation = Boolean(opts.navigation);
@@ -152,7 +133,6 @@ export function browserHeaders(profile, opts = {}) {
   };
 }
 
-// ---------- TLS Impersonation ----------
 let curlBinary = null;
 let curlProbeError = "";
 
