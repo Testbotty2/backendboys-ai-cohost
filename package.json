@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "pip install curl_cffi || true && node apply-antidetection.mjs",
+    "build": "npm install && node apply-antidetection.mjs",
     "start": "node server.mjs"
   },
   "dependencies": {
