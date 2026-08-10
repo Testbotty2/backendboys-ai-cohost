@@ -1,6 +1,6 @@
 {
-  "name": "backendboys-ai-cohost",
-  "version": "7.0.0",
+  "name": "juniors-ai-chat",
+  "version": "7.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
   "dependencies": {
     "dotenv": "latest",
     "express": "latest",
-    "openai": "latest"
+    "openai": "latest",
+    "undici": "latest"
   }
 }
