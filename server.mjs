@@ -2853,8 +2853,7 @@ app.post("/api/realtime-token",express.json(),async(_req,res)=>{
               model:REALTIME_TRANSCRIBE_MODEL,
               prompt:`Livestream audio. The main streamer is labeled ${STREAMER_NAME}. Accurately transcribe casual speech, names, slang, games, cars, products, and stream conversation.`,
               keywords:realtimeTranscriptionKeywords(),
-              languages:["en"],
-              delay:"low"
+              languages:["en"]
             },
             turn_detection:{
               type:"server_vad",
