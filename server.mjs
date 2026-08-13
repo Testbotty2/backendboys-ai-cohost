@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { buildBrowserProfile, calculateHumanTypingDelay, humanizeChatFormatting, impersonatedFetch, tlsImpersonationStatus } from "./fingerprint.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -22,22 +23,82 @@ const OPENAI_REALTIME_TRANSCRIBE_MODEL = String(process.env.OPENAI_REALTIME_TRAN
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || "");
 const ANTHROPIC_BRAIN_MODEL = String(process.env.ANTHROPIC_BRAIN_MODEL || "claude-sonnet-5");
 
+// Cost estimates use current first-party API list prices and actual token usage returned by the APIs.
+// They are a dashboard guardrail, not an invoice. Override with env vars if provider pricing changes.
 const SONNET5_INPUT_USD_PER_M = Number(process.env.SONNET5_INPUT_USD_PER_M || 2);
 const SONNET5_OUTPUT_USD_PER_M = Number(process.env.SONNET5_OUTPUT_USD_PER_M || 10);
 const TRANSCRIBE_USD_PER_MIN = Number(process.env.TRANSCRIBE_USD_PER_MIN || 0.006);
 
-const DEFAULT_PERSONA = String(process.env.BOT_PERSONA || "casual gaming friend; short reactions; helpful when asked; no forced hype; no long paragraphs");
+const BOT_PERSONA = String(process.env.BOT_PERSONA || "casual gaming friend; short reactions; helpful when asked; no forced hype; no long paragraphs");
 const AUTO_SEND_ENV = String(process.env.AUTO_SEND || "true").toLowerCase() === "true";
 const MIN_REPLY_INTERVAL_MS = Math.max(3000, Number(process.env.MIN_REPLY_INTERVAL_MS || 12000));
 const SESSION_SECRET = String(process.env.SESSION_SECRET || "");
 const DASHBOARD_PASSWORD = String(process.env.DASHBOARD_PASSWORD || "");
 const MAX_ACCOUNTS = 10;
 
+const ACCOUNT_STYLE_DEFAULTS = Object.freeze({
+  chattinessPercent: 50,
+  viewerReplyPercent: 25,
+  maxMessageLength: 140,
+  emojiLevel: "low",
+  slangLevel: "normal",
+  mentionUsers: true,
+  cooldownMs: MIN_REPLY_INTERVAL_MS,
+});
+function normalizeAccountStyle(source = {}) {
+  const emojiLevel = ["none", "low", "normal"].includes(String(source.emojiLevel || "")) ? String(source.emojiLevel) : ACCOUNT_STYLE_DEFAULTS.emojiLevel;
+  const slangLevel = ["none", "low", "normal", "high"].includes(String(source.slangLevel || "")) ? String(source.slangLevel) : ACCOUNT_STYLE_DEFAULTS.slangLevel;
+  return {
+    chattinessPercent: Math.round(clamp(source.chattinessPercent ?? ACCOUNT_STYLE_DEFAULTS.chattinessPercent, 0, 100)),
+    viewerReplyPercent: Math.round(clamp(source.viewerReplyPercent ?? ACCOUNT_STYLE_DEFAULTS.viewerReplyPercent, 0, 100)),
+    maxMessageLength: Math.round(clamp(source.maxMessageLength ?? ACCOUNT_STYLE_DEFAULTS.maxMessageLength, 20, 500)),
+    emojiLevel,
+    slangLevel,
+    mentionUsers: source.mentionUsers === undefined ? ACCOUNT_STYLE_DEFAULTS.mentionUsers : Boolean(source.mentionUsers),
+    cooldownMs: Math.round(clamp(source.cooldownMs ?? ACCOUNT_STYLE_DEFAULTS.cooldownMs, 3000, 300000)),
+  };
+}
+
+// ─── Anti-Detection / Fingerprint Spoofing ───
 const ENABLE_FINGERPRINT_SPOOFING = String(process.env.ENABLE_FINGERPRINT_SPOOFING || "true").toLowerCase() !== "false";
 const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLowerCase() !== "false";
 const ANON_FINGERPRINT = ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("kick-api-anonymous") : null;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Standard per-account proxy routing. This is independent of the existing fingerprint module.
+const proxyDispatchers = new Map();
+function normalizeProxyUrl(value) {
+  let raw = String(value || "").trim();
+  if (!raw) return "";
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = "http://" + raw;
+  raw = raw.replace(/^socks5h:\/\//i, "socks5://");
+  const u = new URL(raw);
+  if (!["http:", "https:", "socks:", "socks5:"].includes(u.protocol)) throw new Error("Proxy must use http://, https://, socks://, or socks5://");
+  if (!u.hostname || !u.port) throw new Error("Proxy must include host and port.");
+  return u.toString();
+}
+function proxyDisplay(value) {
+  if (!value) return "direct";
+  try {
+    const u = new URL(value);
+    return u.protocol + "//" + u.hostname + ":" + u.port;
+  } catch { return "configured"; }
+}
+function getProxyDispatcher(proxyUrl) {
+  const key = String(proxyUrl || "");
+  if (!key) return null;
+  let dispatcher = proxyDispatchers.get(key);
+  if (!dispatcher) {
+    dispatcher = new ProxyAgent(key);
+    proxyDispatchers.set(key, dispatcher);
+  }
+  return dispatcher;
+}
+async function accountProxyFetch(account, url, options = {}) {
+  if (!account?.proxy) return null;
+  return undiciFetch(url, { ...options, dispatcher: getProxyDispatcher(account.proxy) });
+}
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const app = express();
@@ -111,7 +172,7 @@ const defaultState = () => ({
     humanReactionPercent: Math.max(0, Math.min(100, Number(process.env.DEFAULT_HUMAN_REACTION_PERCENT || 10))),
     autoSend: AUTO_SEND_ENV,
     viewerReplies: false,
-    persona: DEFAULT_PERSONA,
+    persona: BOT_PERSONA,
     captureFps: 60,
     visionFps: 6,
     visionWidth: 1280,
@@ -163,10 +224,9 @@ function newAccount(label = "") {
     token: null,
     userId: "",
     username: "",
-    proxyUrl: "",
-    proxyStatus: "idle",
-    enabled: true, // Selected/deselected for chatting
-    persona: DEFAULT_PERSONA, // Individual brain persona
+    proxy: "",
+    persona: "",
+    ...normalizeAccountStyle(),
     browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(id) : null,
     createdAt: Date.now(),
   };
@@ -188,10 +248,9 @@ function loadState() {
           token: item.tokenEncrypted ? unseal(item.tokenEncrypted) : (item.token || null),
           userId: String(item.userId || ""),
           username: String(item.username || ""),
-          proxyUrl: String(item.proxyUrl || ""),
-          proxyStatus: String(item.proxyStatus || "idle"),
-          enabled: item.enabled !== undefined ? Boolean(item.enabled) : true,
-          persona: String(item.persona || DEFAULT_PERSONA),
+          proxy: item.proxyEncrypted ? String(unseal(item.proxyEncrypted) || "") : String(item.proxy || ""),
+          persona: String(item.persona || "").slice(0, 600),
+          ...normalizeAccountStyle(item),
           browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(item.id || "anon") : null,
           createdAt: Number(item.createdAt || Date.now()),
         });
@@ -203,10 +262,9 @@ function loadState() {
         token: rawKick.tokenEncrypted ? unseal(rawKick.tokenEncrypted) : (rawKick.token || null),
         userId: String(rawKick.userId || ""),
         username: String(rawKick.username || ""),
-        proxyUrl: "",
-        proxyStatus: "idle",
-        enabled: true,
-        persona: DEFAULT_PERSONA,
+        proxy: "",
+        persona: "",
+        ...normalizeAccountStyle(),
         browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("legacy-account-1") : null,
         createdAt: Date.now(),
       });
@@ -234,7 +292,9 @@ function saveState() {
     ...account,
     tokenEncrypted: seal(account.token),
     token: undefined,
-    browserProfile: undefined,
+    proxyEncrypted: seal(account.proxy),
+    proxy: undefined,
+    browserProfile: undefined, // regenerable from account.id
   }));
   fs.writeFileSync(STATE_FILE, JSON.stringify(snapshot, null, 2));
 }
@@ -250,11 +310,18 @@ function log(message, extra = "") {
 
 let transcripts = [];
 let recentChat = [];
+let recentOutgoing = [];
+const accountRuntime = new Map();
+const proxyTestStatus = new Map();
+function runtimeForAccount(accountId) {
+  const id = String(accountId || "");
+  if (!accountRuntime.has(id)) accountRuntime.set(id, { history: [], lastMessageAt: 0, messagesThisStream: 0 });
+  return accountRuntime.get(id);
+}
 let latestFrames = [];
 let latestContextAt = 0;
 let lastReply = "";
 let lastReplyAt = 0;
-let accountLastReplyAt = {};
 let lastBrain = null;
 let streamSession = { isLive: false, startedAt: "", sessionId: "", title: "", category: "", uptimeSeconds: 0 };
 let chatSubscription = { active: false, id: "", broadcasterUserId: "", error: "" };
@@ -350,6 +417,7 @@ function formatOutgoing(s) {
   return cleanText(s, 500)
     .replace(/[\u2010-\u2015\u2212]/g, " ")
     .replace(/-{3,}/g, " ")
+    .replace(/,/g, " ")
     .replace(/\.+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -358,11 +426,13 @@ function activeAccount() {
   return state.kick.accounts.find(a => a.id === state.kick.activeAccountId) || null;
 }
 function connectedAccounts() {
-  return state.kick.accounts.filter(a => Boolean(a.token?.access_token) && a.enabled !== false);
+  return state.kick.accounts.filter(a => Boolean(a.token?.access_token));
 }
 function clearContext(reason) {
   transcripts = [];
   recentChat = [];
+  recentOutgoing = [];
+  accountRuntime.clear();
   latestFrames = [];
   latestContextAt = 0;
   lastBrain = null;
@@ -370,6 +440,130 @@ function clearContext(reason) {
 }
 function recentTranscriptText() { return transcripts.slice(-12).map(x => x.text).join(" | "); }
 function recentChatText() { return recentChat.slice(-20).map(x => "@" + x.username + ": " + x.content).join("\n"); }
+function recentOutgoingText() { return recentOutgoing.slice(-12).map(x => x.content).join(" | "); }
+function recentAccountOutgoingText(accountId) {
+  return (runtimeForAccount(accountId).history || []).slice(-12).map(x => x.content).join(" | ");
+}
+function normalizeRepeatText(value) {
+  return cleanText(value, 500)
+    .toLowerCase()
+    .replace(/@\w+/g, " ")
+    .replace(/[^a-z0-9']+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function repeatSimilarity(a, b) {
+  const left = normalizeRepeatText(a);
+  const right = normalizeRepeatText(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  const aWords = left.split(" ").filter(Boolean);
+  const bWords = right.split(" ").filter(Boolean);
+  if (Math.min(aWords.length, bWords.length) >= 2 && (left.includes(right) || right.includes(left))) return 0.98;
+  const aSet = new Set(aWords);
+  const bSet = new Set(bWords);
+  let overlap = 0;
+  for (const word of aSet) if (bSet.has(word)) overlap++;
+  if (!overlap) return 0;
+  const containment = overlap / Math.min(aSet.size, bSet.size);
+  const jaccard = overlap / new Set([...aSet, ...bSet]).size;
+  return Math.max(jaccard, containment * 0.92);
+}
+const REPEAT_STOPWORDS = new Set("a an the this that these those it its is are was were be been being to of for on in at with and or but so just really actually kinda kind like bro bruh yo nah yeah yea lets let go going got get have has had i im i'm you youre you're your we we're they they're he he's she she's there here from as if then than now still".split(/\s+/));
+const REPEAT_CANON = new Map(Object.entries({
+  build:"loadout",class:"loadout",setup:"loadout",loadout:"loadout",
+  rotate:"rotation",rotated:"rotation",rotating:"rotation",rotation:"rotation",
+  kill:"kill",kills:"kill",elim:"kill",elims:"kill",elimination:"kill",eliminations:"kill",
+  win:"win",wins:"win",won:"win",dub:"win",victory:"win",
+  aim:"aim",aiming:"aim",accuracy:"aim",shot:"aim",shots:"aim",
+  team:"squad",squad:"squad",squads:"squad",
+  teammate:"teammate",teammates:"teammate",
+  zone:"zone",circle:"zone",gas:"zone",
+  loot:"loot",looting:"loot",looted:"loot",
+  clutch:"clutch",clutched:"clutch",clutching:"clutch",
+  move:"movement",moves:"movement",moving:"movement",movement:"movement",
+  armor:"plates",plate:"plates",plates:"plates",
+  revive:"revive",revived:"revive",reviving:"revive",res:"revive",
+  sniper:"sniper",sniping:"sniper",snipe:"sniper",
+  push:"push",pushed:"push",pushing:"push",rush:"push",rushed:"push",rushing:"push",
+  camp:"camp",camped:"camp",camping:"camp",rat:"camp",ratting:"camp",
+  clean:"praise",nice:"praise",good:"praise",great:"praise",sick:"praise",nasty:"praise",crazy:"praise",insane:"praise",filthy:"praise",
+  fried:"dominate",fry:"dominate",melted:"dominate",melt:"dominate",cooked:"dominate",destroyed:"dominate",smoked:"dominate",
+  bad:"negative",awful:"negative",terrible:"negative",rough:"negative",trash:"negative"
+}));
+function conceptTokens(value) {
+  const words = normalizeRepeatText(value).split(" ").filter(Boolean);
+  const out = new Set();
+  for (let word of words) {
+    if (REPEAT_STOPWORDS.has(word)) continue;
+    word = REPEAT_CANON.get(word) || word.replace(/(?:ing|ed|es|s)$/i, "");
+    if (!word || word.length < 3 || REPEAT_STOPWORDS.has(word)) continue;
+    out.add(REPEAT_CANON.get(word) || word);
+  }
+  return out;
+}
+function semanticRepeatSimilarity(a, b) {
+  const lexical = repeatSimilarity(a, b);
+  const left = conceptTokens(a);
+  const right = conceptTokens(b);
+  if (!left.size || !right.size) return lexical;
+  let overlap = 0;
+  for (const token of left) if (right.has(token)) overlap++;
+  if (!overlap) return lexical;
+  const containment = overlap / Math.min(left.size, right.size);
+  const jaccard = overlap / new Set([...left, ...right]).size;
+  const hasSharedTopic = [...left].some(x => right.has(x) && !["praise", "negative", "dominate"].includes(x));
+  const sameTone = [...left].some(x => ["praise", "negative", "dominate"].includes(x) && right.has(x));
+  let semantic = Math.max(jaccard, containment * 0.88);
+  if (hasSharedTopic && sameTone) semantic = Math.max(semantic, 0.9);
+  if (hasSharedTopic && Math.min(left.size, right.size) <= 2) semantic = Math.max(semantic, 0.84);
+  return Math.max(lexical, semantic);
+}
+function recentRepeatReason(reply, accountId = state.kick.activeAccountId) {
+  const now = Date.now();
+  const own = runtimeForAccount(accountId).history || [];
+  for (const item of own.slice(-24).reverse()) {
+    if (now - Number(item.at || 0) > 15 * 60 * 1000) continue;
+    if (semanticRepeatSimilarity(reply, item.content) >= 0.72) return "too similar in meaning to this account's recent replies";
+  }
+  for (const item of recentOutgoing.slice(-30).reverse()) {
+    if (now - Number(item.at || 0) > 10 * 60 * 1000) continue;
+    if (semanticRepeatSimilarity(reply, item.content) >= 0.8) return "too similar to a recent co-host reply";
+  }
+  for (const item of recentChat.slice(-35).reverse()) {
+    const at = Number(item.receivedAt || Date.parse(item.createdAt || "") || 0);
+    if (at && now - at > 2 * 60 * 1000) continue;
+    if (semanticRepeatSimilarity(reply, item.content) >= 0.84) return "too similar in meaning to recent viewer chat";
+  }
+  return "";
+}
+function effectiveAccountThreshold(account, baseThreshold) {
+  const chattiness = Number(account?.chattinessPercent ?? ACCOUNT_STYLE_DEFAULTS.chattinessPercent);
+  return Math.round(clamp(Number(baseThreshold || 0) + (50 - chattiness) * 0.5, 0, 100));
+}
+function removeEmoji(value) {
+  return String(value || "").replace(/\p{Extended_Pictographic}|\uFE0F/gu, "").replace(/\s+/g, " ").trim();
+}
+function applyAccountOutputStyle(value, ctx = {}) {
+  const account = activeAccount();
+  let text = formatOutgoing(value || "");
+  if (!account) return text;
+  if (account.emojiLevel === "none") text = removeEmoji(text);
+  if (ctx.viewerMessage && account.mentionUsers) {
+    const username = cleanText(ctx.viewerMessage.username || "", 100).replace(/^@+/, "").trim();
+    if (username) {
+      const escapedUsername = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // Always force the real viewer mention to the very beginning of a viewer reply.
+      // Remove any copy the model may have placed elsewhere first so it cannot duplicate it.
+      text = text.replace(new RegExp("@" + escapedUsername + "\\b", "ig"), "").replace(/\s+/g, " ").trim();
+      text = "@" + username + (text ? " " + text : "");
+    }
+  }
+  return cleanText(text, account.maxMessageLength || ACCOUNT_STYLE_DEFAULTS.maxMessageLength);
+}
+function accountCooldownMs(account) {
+  return Math.round(clamp(account?.cooldownMs ?? MIN_REPLY_INTERVAL_MS, 3000, 300000));
+}
 function publicStatus() {
   const active = activeAccount();
   return {
@@ -391,10 +585,22 @@ function publicStatus() {
         connected: Boolean(a.token?.access_token),
         username: a.username,
         userId: a.userId,
-        proxyUrl: a.proxyUrl || "",
-        proxyStatus: a.proxyStatus || "idle",
-        enabled: a.enabled !== false,
-        persona: a.persona || DEFAULT_PERSONA,
+        proxyConfigured: Boolean(a.proxy),
+        proxyDisplay: proxyDisplay(a.proxy),
+        persona: String(a.persona || ""),
+        personaSaved: Boolean(String(a.persona || "").trim()),
+        tokenValid: Boolean(a.token?.access_token) && (!a.token?.expires_at || Number(a.token.expires_at) > Date.now() + 15000),
+        chattinessPercent: a.chattinessPercent,
+        viewerReplyPercent: a.viewerReplyPercent,
+        maxMessageLength: a.maxMessageLength,
+        emojiLevel: a.emojiLevel,
+        slangLevel: a.slangLevel,
+        mentionUsers: Boolean(a.mentionUsers),
+        cooldownMs: accountCooldownMs(a),
+        lastMessageAt: runtimeForAccount(a.id).lastMessageAt || 0,
+        messagesThisStream: runtimeForAccount(a.id).messagesThisStream || 0,
+        cooldownRemainingMs: Math.max(0, accountCooldownMs(a) - (Date.now() - Number(runtimeForAccount(a.id).lastMessageAt || 0))),
+        proxyTest: proxyTestStatus.get(a.id) || null,
         active: a.id === state.kick.activeAccountId,
       })),
       broadcasterId: state.kick.broadcasterId,
@@ -427,9 +633,11 @@ function publicStatus() {
   };
 }
 
-async function kickJson(url, options = {}) {
+async function kickJson(url, options = {}, account = null) {
   let r;
-  if (ENABLE_FINGERPRINT_SPOOFING && ANON_FINGERPRINT) {
+  if (account?.proxy) {
+    r = await accountProxyFetch(account, url, options);
+  } else if (ENABLE_FINGERPRINT_SPOOFING && ANON_FINGERPRINT) {
     r = await impersonatedFetch(null, url, options, { profile: ANON_FINGERPRINT });
   } else {
     r = await fetch(url, options);
@@ -446,8 +654,8 @@ async function getKickAppToken() {
   kickAppToken = { ...data, expiresAt: data.expires_in ? Date.now() + Number(data.expires_in) * 1000 : 0 };
   return data.access_token;
 }
-async function identifyKickUser(accessToken) {
-  const data = await kickJson("https://api.kick.com/public/v1/users", { headers: { Authorization: "Bearer " + accessToken, Accept: "application/json" } });
+async function identifyKickUser(accessToken, account = null) {
+  const data = await kickJson("https://api.kick.com/public/v1/users", { headers: { Authorization: "Bearer " + accessToken, Accept: "application/json" } }, account);
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   return { userId: String(item?.user_id || item?.id || ""), username: String(item?.name || item?.username || item?.slug || "") };
 }
@@ -462,7 +670,7 @@ async function refreshKickToken(accountId = state.kick.activeAccountId) {
     client_id: KICK_CLIENT_ID,
     client_secret: KICK_CLIENT_SECRET,
   });
-  const data = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+  const data = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, account);
   account.token = { ...data, expires_at: data.expires_in ? Date.now() + Number(data.expires_in) * 1000 : 0 };
   saveState();
   return account.token;
@@ -471,7 +679,8 @@ async function resolveChannel(slug) {
   const token = await refreshKickToken();
   const clean = cleanText(slug, 100);
   if (!clean) throw new Error("Enter the streamer Kick username.");
-  const data = await kickJson("https://api.kick.com/public/v1/channels?slug=" + encodeURIComponent(clean), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } });
+  const account = activeAccount();
+  const data = await kickJson("https://api.kick.com/public/v1/channels?slug=" + encodeURIComponent(clean), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } }, account);
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   const id = String(item?.broadcaster_user_id || "");
   if (!id) throw new Error("Kick returned no broadcaster_user_id.");
@@ -485,7 +694,8 @@ async function resolveChannel(slug) {
 async function queryStreamSession() {
   if (!state.kick.broadcasterId || !activeAccount()?.token?.access_token) return streamSession;
   const token = await refreshKickToken();
-  const data = await kickJson("https://api.kick.com/public/v1/channels?broadcaster_user_id=" + encodeURIComponent(state.kick.broadcasterId), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } });
+  const account = activeAccount();
+  const data = await kickJson("https://api.kick.com/public/v1/channels?broadcaster_user_id=" + encodeURIComponent(state.kick.broadcasterId), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } }, account);
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   const stream = item?.stream || {};
   const isLive = Boolean(stream?.is_live);
@@ -504,6 +714,61 @@ async function queryStreamSession() {
   if (streamSession.isLive && !next.isLive) clearContext("stream went offline");
   streamSession = next;
   return next;
+}
+async function postKickChat(content, replyToMessageId = "") {
+  const account = activeAccount();
+  if (!account) throw new Error("Select an active co-host account first.");
+
+  // Structural cleanup first
+  const clean = formatOutgoing(content);
+  // Then humanize the formatting (casual lowercase, trailing period removal, etc.)
+  const text = ENABLE_FINGERPRINT_SPOOFING ? humanizeChatFormatting(clean) : clean;
+
+  if (!text) throw new Error("No message to send.");
+
+  // Human typing delay before sending (reads like a real person typed it)
+  if (ENABLE_HUMAN_DELAY && account.browserProfile) {
+    const delay = calculateHumanTypingDelay(text, account.browserProfile);
+    await sleep(delay);
+  }
+
+  const token = await refreshKickToken(account.id);
+  if (!state.kick.broadcasterId) throw new Error("Resolve the streamer channel first.");
+  const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
+  if (replyToMessageId) payload.reply_to_message_id = String(replyToMessageId);
+
+  // Use account-specific fingerprint for the chat send
+  const chatUrl = "https://api.kick.com/public/v1/chat";
+  const chatOpts = {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  };
+
+  let data;
+  if (account.proxy) {
+    data = await kickJson(chatUrl, chatOpts, account);
+  } else if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
+    const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile });
+    data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
+  } else {
+    data = await kickJson(chatUrl, chatOpts);
+  }
+
+  lastReply = text;
+  lastReplyAt = Date.now();
+  recentOutgoing.push({ content: text, at: lastReplyAt, accountId: account.id });
+  if (recentOutgoing.length > 40) recentOutgoing.splice(0, recentOutgoing.length - 40);
+  const accountRun = runtimeForAccount(account.id);
+  accountRun.lastMessageAt = lastReplyAt;
+  accountRun.messagesThisStream++;
+  accountRun.history.push({ content: text, at: lastReplyAt });
+  if (accountRun.history.length > 60) accountRun.history.splice(0, accountRun.history.length - 60);
+  state.metrics.sent++;
+  saveState();
+  log("Kick sent as @" + (account.username || account.label) + ":", text);
+  return data;
 }
 
 const KICK_PUBLIC_KEY_FALLBACK = `-----BEGIN PUBLIC KEY-----
@@ -571,16 +836,24 @@ function safeJSON(text) {
   if (match) { try { return JSON.parse(match[0]); } catch {} }
   return null;
 }
-function brainPrompt(persona, { transcript, eventType = "streamer_speech", viewerMessage = null }) {
+function brainPrompt({ transcript, eventType = "streamer_speech", viewerMessage = null }) {
+  const account = activeAccount();
+  const persona = account?.persona || state.settings.persona;
+  const viewerMentionRule = viewerMessage && account?.mentionUsers
+    ? "If you choose to reply to this viewer, address them as @" + viewerMessage.username + ". Do not invent or substitute another username."
+    : "Do not add an @username unless it is clearly useful and present in the supplied current-stream chat.";
   return [
     "You are the decision-and-reply brain for a disclosed AI co-host in a gaming livestream.",
     "Persona: " + persona,
+    "Account chat style: chattiness " + Number(account?.chattinessPercent ?? 50) + "%; viewer reply rate " + Number(account?.viewerReplyPercent ?? 25) + "%; max message length " + Number(account?.maxMessageLength ?? 140) + " characters; emoji level " + String(account?.emojiLevel || "low") + "; slang level " + String(account?.slangLevel || "normal") + ".",
+    viewerMentionRule,
     "Keep chat replies short, casual, specific to what is happening, usually 2-14 words. Avoid polished assistant language.",
-    "Do not invent game events, facts, or what you can see. Use only the supplied context and attached recent frames.",
+    "Do not invent game events, facts, usernames, or what you can see. Use only the supplied context and attached recent frames.",
     "The attached frames, when present, are chronological recent snapshots ending with the newest frame.",
     "A low reaction score is fine for ordinary gaming moments. Score 0-100 for how natural it would be for a regular co-host to say something now.",
     "If the streamer directly asks a question or clearly addresses the co-host, should_reply should normally be true.",
     "Viewer chat is context. Do not reply to a viewer unless event_type is viewer_chat and the message genuinely invites a response.",
+    "Do not echo, copy, lightly paraphrase, or repeat the same idea as recent viewer chat or this account's recent replies. If the idea was already said, stay quiet or choose a genuinely different observation.",
     "Return ONLY compact JSON with keys: should_reply (boolean), reaction_score (0-100 integer), reply (string), reason (short string).",
     "",
     "event_type: " + eventType,
@@ -588,13 +861,15 @@ function brainPrompt(persona, { transcript, eventType = "streamer_speech", viewe
     "viewer event: " + (viewerMessage ? "@" + viewerMessage.username + ": " + viewerMessage.content : "(none)"),
     "recent streamer speech: " + (recentTranscriptText() || "(none)"),
     "recent current-stream chat:\n" + (recentChatText() || "(none)"),
+    "recent replies by this account: " + (recentAccountOutgoingText(account?.id) || "(none)"),
+    "recent replies by all co-host accounts: " + (recentOutgoingText() || "(none)"),
     "stream title: " + (streamSession.title || "(unknown)"),
     "stream category/game: " + (streamSession.category || "(unknown)"),
   ].join("\n");
 }
-async function callAnthropicBrain(persona, ctx) {
+async function callAnthropicBrain(ctx) {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured.");
-  const content = [{ type: "text", text: brainPrompt(persona, ctx) }];
+  const content = [{ type: "text", text: brainPrompt(ctx) }];
   const burst = effectiveVisionBurst();
   for (const frame of (burst > 0 ? latestFrames.slice(-burst) : [])) {
     const image = extractBase64Image(frame.dataUrl);
@@ -620,9 +895,9 @@ async function callAnthropicBrain(persona, ctx) {
   const text = (Array.isArray(data?.content) ? data.content : []).filter(x => x.type === "text").map(x => x.text).join("\n");
   return { result: safeJSON(text), usage: data?.usage || {} };
 }
-async function callOpenAIBrain(persona, ctx) {
+async function callOpenAIBrain(ctx) {
   if (!openai) throw new Error("OPENAI_API_KEY is not configured.");
-  const content = [{ type: "input_text", text: brainPrompt(persona, ctx) }];
+  const content = [{ type: "input_text", text: brainPrompt(ctx) }];
   const burst = effectiveVisionBurst();
   for (const frame of (burst > 0 ? latestFrames.slice(-burst) : [])) {
     if (extractBase64Image(frame.dataUrl)) content.push({ type: "input_image", image_url: frame.dataUrl, detail: "low" });
@@ -637,8 +912,6 @@ async function callOpenAIBrain(persona, ctx) {
 }
 async function runBrain(ctx) {
   const beforeCost = costStatus();
-  const connected = connectedAccounts();
-
   if (beforeCost.throttle === "paused") {
     const threshold = Number(state.settings.humanReactionPercent || 0);
     lastBrain = { provider: state.settings.provider, score: 0, threshold, shouldReply: false, reason: "stream budget guard reached; auto brain paused", reply: "" };
@@ -646,108 +919,46 @@ async function runBrain(ctx) {
     log("Budget guard:", "$" + beforeCost.totalUsd.toFixed(2) + " / $" + beforeCost.budget.toFixed(2) + " • auto brain paused");
     return { action: "skip", ...lastBrain, cost: beforeCost };
   }
-
-  if (!connected.length) {
-    state.metrics.brainCalls++;
-    const provider = state.settings.provider;
-    const called = provider === "openai" ? await callOpenAIBrain(state.settings.persona, ctx) : await callAnthropicBrain(state.settings.persona, ctx);
-    const result = called?.result;
-    recordBrainUsage(provider, called?.usage || {});
-    if (!result || typeof result !== "object") throw new Error(provider + " returned invalid JSON.");
-    const score = Math.round(clamp(result.reaction_score, 0, 100));
-    let reply = formatOutgoing(result.reply || "");
-    const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
-    const threshold = Number(state.settings.humanReactionPercent || 0);
-    const allowedByScore = score >= threshold || directlyAddressed;
-    const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
-    lastBrain = { provider, score, threshold, shouldReply, reason: cleanText(result.reason, 160), reply };
-    latestContextAt = Date.now();
-    if (!shouldReply) { state.metrics.skipped++; saveState(); return { action: "skip", ...lastBrain }; }
-    if (Date.now() - lastReplyAt < MIN_REPLY_INTERVAL_MS && !directlyAddressed) { state.metrics.skipped++; saveState(); return { action: "skip", ...lastBrain, reason: "reply cooldown" }; }
-    if (!state.settings.autoSend) return { action: "preview", ...lastBrain };
-    const token = await refreshKickToken();
-    const text = ENABLE_FINGERPRINT_SPOOFING ? humanizeChatFormatting(reply) : reply;
-    const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
-    if (ctx.viewerMessage?.messageId) payload.reply_to_message_id = String(ctx.viewerMessage.messageId);
-    const chatUrl = "https://api.kick.com/public/v1/chat";
-    const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
-    const r = await kickJson(chatUrl, chatOpts);
-    lastReply = text; lastReplyAt = Date.now(); state.metrics.sent++; saveState();
-    log("Kick sent:", text);
-    return { action: "sent", ...lastBrain };
-  }
-
-  // ─── Multi-account: each enabled account independently brains ───
-  let anySent = false;
-  let lastResult = null;
-
-  for (const account of connected) {
-    try {
-      const accountCooldown = accountLastReplyAt[account.id] || 0;
-      if (Date.now() - accountCooldown < MIN_REPLY_INTERVAL_MS) continue;
-
-      state.metrics.brainCalls++;
-      const provider = state.settings.provider;
-      const accountPersona = account.persona || state.settings.persona;
-      const called = provider === "openai" ? await callOpenAIBrain(accountPersona, ctx) : await callAnthropicBrain(accountPersona, ctx);
-      const result = called?.result;
-      recordBrainUsage(provider, called?.usage || {});
-
-      if (!result || typeof result !== "object") continue;
-
-      const score = Math.round(clamp(result.reaction_score, 0, 100));
-      let reply = formatOutgoing(result.reply || "");
-      if (ENABLE_FINGERPRINT_SPOOFING) reply = humanizeChatFormatting(reply);
-
-      // Prevent duplicate text across accounts
-      if (reply.toLowerCase() === lastReply.toLowerCase()) {
-        reply = formatOutgoing("yeah, " + reply);
-        if (ENABLE_FINGERPRINT_SPOOFING) reply = humanizeChatFormatting(reply);
-      }
-
-      const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
-      const threshold = Number(state.settings.humanReactionPercent || 0);
-      const allowedByScore = score >= threshold || directlyAddressed;
-      const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
-
-      if (!shouldReply || !state.settings.autoSend) continue;
-
-      if (ENABLE_HUMAN_DELAY && account.browserProfile) {
-        await sleep(calculateHumanTypingDelay(reply, account.browserProfile));
-      }
-
-      const token = await refreshKickToken(account.id);
-      if (!state.kick.broadcasterId) throw new Error("Resolve the streamer channel first.");
-      const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: reply, type: "user" };
-      if (ctx.viewerMessage?.messageId) payload.reply_to_message_id = String(ctx.viewerMessage.messageId);
-
-      const chatUrl = "https://api.kick.com/public/v1/chat";
-      const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
-
-      let data;
-      if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
-        const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile, proxyUrl: account.proxyUrl || "" });
-        data = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
-      } else {
-        data = await kickJson(chatUrl, chatOpts);
-      }
-
-      accountLastReplyAt[account.id] = Date.now();
-      lastReply = reply;
-      lastReplyAt = Date.now();
-      state.metrics.sent++;
-      lastResult = data;
-      anySent = true;
-      lastBrain = { provider, score, threshold, shouldReply: true, reason: cleanText(result.reason, 160), reply };
-      log("@" + (account.username || account.label) + " sent:", reply);
-    } catch (e) {
-      log("@" + (account.username || account.label) + " error:", e.message || e);
+  state.metrics.brainCalls++;
+  const provider = state.settings.provider;
+  const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
+  const result = called?.result;
+  recordBrainUsage(provider, called?.usage || {});
+  if (!result || typeof result !== "object") throw new Error(provider + " returned invalid JSON.");
+  const score = Math.round(clamp(result.reaction_score, 0, 100));
+  const account = activeAccount();
+  const reply = applyAccountOutputStyle(result.reply || "", ctx);
+  const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
+  const threshold = effectiveAccountThreshold(account, state.settings.humanReactionPercent);
+  const allowedByScore = score >= threshold || directlyAddressed;
+  let shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
+  let reason = cleanText(result.reason, 160);
+  if (shouldReply) {
+    const repeatReason = recentRepeatReason(reply, account?.id);
+    if (repeatReason) {
+      shouldReply = false;
+      reason = repeatReason;
     }
   }
+  lastBrain = { provider, score, threshold, shouldReply, reason, reply };
   latestContextAt = Date.now();
   saveState();
-  return { action: anySent ? "sent" : "skip", ...(lastBrain || { provider: state.settings.provider, score: 0, threshold: 0, shouldReply: false, reason: "no accounts replied", reply: "" }) };
+  if (!shouldReply) {
+    state.metrics.skipped++;
+    saveState();
+    log("Brain quiet:", score + "% at threshold " + threshold + "% • " + lastBrain.reason);
+    return { action: "skip", ...lastBrain };
+  }
+  const accountRun = runtimeForAccount(account?.id);
+  const cooldownMs = accountCooldownMs(account);
+  if (Date.now() - Number(accountRun.lastMessageAt || 0) < cooldownMs && !directlyAddressed) {
+    state.metrics.skipped++;
+    saveState();
+    return { action: "skip", ...lastBrain, reason: "account reply cooldown" };
+  }
+  if (!state.settings.autoSend) return { action: "preview", ...lastBrain };
+  await postKickChat(reply, ctx.viewerMessage?.messageId || "");
+  return { action: "sent", ...lastBrain };
 }
 
 app.post("/webhooks/kick", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
@@ -798,7 +1009,11 @@ app.post("/webhooks/kick", express.raw({ type: "application/json", limit: "1mb" 
     state.metrics.chatEvents++;
     saveState();
 
-    if (state.settings.viewerReplies && Date.now() - lastReplyAt >= MIN_REPLY_INTERVAL_MS) {
+    const viewerAccount = activeAccount();
+    const viewerRun = runtimeForAccount(viewerAccount?.id);
+    const viewerChance = Number(viewerAccount?.viewerReplyPercent ?? ACCOUNT_STYLE_DEFAULTS.viewerReplyPercent);
+    const viewerCooldown = accountCooldownMs(viewerAccount);
+    if (state.settings.viewerReplies && viewerAccount && Date.now() - Number(viewerRun.lastMessageAt || 0) >= viewerCooldown && Math.random() * 100 < viewerChance) {
       setImmediate(async () => {
         try {
           const result = await runBrain({ transcript: "", eventType: "viewer_chat", viewerMessage: item });
@@ -845,6 +1060,7 @@ app.post("/logout", (req, res) => {
   res.redirect("/login");
 });
 
+// Keep provider webhooks, health checks, and the OAuth callback reachable without dashboard login.
 app.use((req, res, next) => {
   if (req.path === "/health" || req.path === "/auth/kick/callback") return next();
   return requireDashboardAuth(req, res, next);
@@ -872,18 +1088,69 @@ app.post("/api/accounts/:id/active", (req, res) => {
   log("Active sender:", account.username ? "@" + account.username : account.label);
   res.json({ ok: true });
 });
-app.post("/api/accounts/:id/toggle", (req, res) => {
+app.post("/api/accounts/:id/proxy", (req, res) => {
+  try {
+    const account = state.kick.accounts.find(a => a.id === req.params.id);
+    if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
+    const next = normalizeProxyUrl(req.body?.proxy || "");
+    account.proxy = next;
+    proxyTestStatus.delete(account.id);
+    saveState();
+    log("Account proxy:", (account.username ? "@" + account.username : account.label) + " → " + proxyDisplay(next));
+    res.json({ ok: true, configured: Boolean(next), display: proxyDisplay(next) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message || String(e) });
+  }
+});
+app.post("/api/accounts/:id/proxy-test", async (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-  account.enabled = req.body?.enabled !== undefined ? Boolean(req.body.enabled) : !account.enabled;
-  saveState();
-  log("Account @" + (account.username || account.label) + " enabled: " + account.enabled);
-  res.json({ ok: true, enabled: account.enabled });
+  if (!account.proxy) return res.status(400).json({ ok: false, error: "Save a proxy for this account first." });
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const r = await accountProxyFetch(account, "https://api.ipify.org?format=json", { headers: { Accept: "application/json" }, signal: controller.signal });
+    const text = await r.text();
+    if (!r.ok) throw new Error("Proxy test HTTP " + r.status);
+    let ip = "";
+    try { ip = String(JSON.parse(text)?.ip || ""); } catch {}
+    const result = { ok: true, latencyMs: Date.now() - started, ip, at: Date.now() };
+    proxyTestStatus.set(account.id, result);
+    log("Proxy test:", (account.username ? "@" + account.username : account.label) + " → connected in " + result.latencyMs + "ms");
+    res.json(result);
+  } catch (e) {
+    const result = { ok: false, latencyMs: Date.now() - started, error: cleanText(e.message || e, 180), at: Date.now() };
+    proxyTestStatus.set(account.id, result);
+    log("Proxy test failed:", (account.username ? "@" + account.username : account.label) + " → " + result.error);
+    res.status(400).json(result);
+  } finally {
+    clearTimeout(timer);
+  }
 });
 app.post("/api/accounts/:id/persona", (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-  account.persona = cleanText(req.body?.persona, 600) || DEFAULT_PERSONA;
+  account.persona = cleanText(req.body?.persona || "", 600);
+  saveState();
+  res.json({ ok: true, persona: account.persona });
+});
+app.post("/api/accounts/:id/style", (req, res) => {
+  const account = state.kick.accounts.find(a => a.id === req.params.id);
+  if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
+  const body = req.body || {};
+  if (body.persona !== undefined) account.persona = cleanText(body.persona || "", 600);
+  const style = normalizeAccountStyle({
+    ...account,
+    chattinessPercent: body.chattinessPercent ?? account.chattinessPercent,
+    viewerReplyPercent: body.viewerReplyPercent ?? account.viewerReplyPercent,
+    maxMessageLength: body.maxMessageLength ?? account.maxMessageLength,
+    emojiLevel: body.emojiLevel ?? account.emojiLevel,
+    slangLevel: body.slangLevel ?? account.slangLevel,
+    mentionUsers: body.mentionUsers === undefined ? account.mentionUsers : Boolean(body.mentionUsers),
+    cooldownMs: body.cooldownSeconds !== undefined ? Number(body.cooldownSeconds) * 1000 : account.cooldownMs,
+  });
+  Object.assign(account, style);
   saveState();
   res.json({ ok: true });
 });
@@ -896,37 +1163,28 @@ app.post("/api/accounts/:id/disconnect", (req, res) => {
   saveState();
   res.json({ ok: true });
 });
-app.post("/api/accounts/:id/proxy", async (req, res) => {
-  const account = state.kick.accounts.find(a => a.id === req.params.id);
-  if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-  let raw = String(req.body?.proxyUrl || "").trim();
-  if (raw && !raw.includes("://")) raw = "socks5://" + raw;
-  account.proxyUrl = raw;
-  if (raw) {
-    try {
-      account.proxyStatus = "testing";
-      saveState();
-      const testRes = await impersonatedFetch(account, "https://api.ipify.org?format=json", { method: "GET" }, { profile: account.browserProfile, proxyUrl: account.proxyUrl });
-      account.proxyStatus = testRes.ok ? "connected" : "error";
-    } catch { account.proxyStatus = "error"; }
-  } else { account.proxyStatus = "idle"; }
-  saveState();
-  log("Proxy status for @" + (account.username || account.label) + ": " + account.proxyStatus);
-  res.json({ ok: true, proxyStatus: account.proxyStatus });
-});
 app.delete("/api/accounts/:id", (req, res) => {
   const before = state.kick.accounts.length;
   state.kick.accounts = state.kick.accounts.filter(a => a.id !== req.params.id);
   if (state.kick.accounts.length === before) return res.status(404).json({ ok: false, error: "Account not found." });
+  accountRuntime.delete(req.params.id);
+  proxyTestStatus.delete(req.params.id);
   if (state.kick.activeAccountId === req.params.id) state.kick.activeAccountId = state.kick.accounts[0]?.id || "";
   saveState();
   res.json({ ok: true });
 });
 
+function kickOAuthResultPage(ok, message, accountId = "") {
+  const safeMessage = cleanText(message || "", 800);
+  const payload = JSON.stringify({ type: "kick-oauth-complete", ok: Boolean(ok), accountId: String(accountId || ""), message: safeMessage }).replace(/</g, "\\u003c");
+  const title = ok ? "Kick account connected" : "Kick account not connected";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:30px}div{max-width:620px;margin:10vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:22px}a{color:#55d6ff}</style></head><body><div><h2>${title}</h2><p>${safeMessage.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</p><p><a href="/">Return to dashboard</a></p></div><script>try{if(window.opener&&!window.opener.closed)window.opener.postMessage(${payload},location.origin)}catch(e){}${ok ? 'setTimeout(()=>window.close(),700);' : ''}</script></body></html>`;
+}
+
 app.get("/auth/kick/start", (req, res) => {
   try {
     if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !KICK_REDIRECT_URI) throw new Error("Missing Kick OAuth environment variables.");
-    const accountId = String(req.query.accountId || "").trim();
+    const accountId = String(req.query.accountId || state.kick.activeAccountId || "");
     const account = state.kick.accounts.find(a => a.id === accountId);
     if (!account) throw new Error("Add an account slot first.");
     const verifier = crypto.randomBytes(48).toString("base64url");
@@ -934,7 +1192,15 @@ app.get("/auth/kick/start", (req, res) => {
     const oauthState = crypto.randomBytes(24).toString("base64url");
     oauthPending.set(oauthState, { verifier, accountId, createdAt: Date.now() });
     for (const [key, value] of oauthPending) if (Date.now() - value.createdAt > 10 * 60 * 1000) oauthPending.delete(key);
-    const qs = new URLSearchParams({ response_type: "code", client_id: KICK_CLIENT_ID, redirect_uri: KICK_REDIRECT_URI, scope: "user:read channel:read chat:write", state: oauthState, code_challenge: challenge, code_challenge_method: "S256", prompt: "login" });
+    const qs = new URLSearchParams({
+      response_type: "code",
+      client_id: KICK_CLIENT_ID,
+      redirect_uri: KICK_REDIRECT_URI,
+      scope: "user:read channel:read chat:write",
+      state: oauthState,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
     res.redirect("https://id.kick.com/oauth/authorize?" + qs.toString());
   } catch (e) {
     res.status(500).send("Kick authorization error: " + cleanText(e.message || e, 500));
@@ -948,18 +1214,31 @@ app.get("/auth/kick/callback", async (req, res) => {
     if (!pending) throw new Error("OAuth state expired or invalid.");
     const account = state.kick.accounts.find(a => a.id === pending.accountId);
     if (!account) throw new Error("Account slot no longer exists.");
-    const body = new URLSearchParams({ grant_type: "authorization_code", code: String(req.query.code || ""), client_id: KICK_CLIENT_ID, client_secret: KICK_CLIENT_SECRET, redirect_uri: KICK_REDIRECT_URI, code_verifier: pending.verifier });
-    const token = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
-    const identity = await identifyKickUser(token.access_token);
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: String(req.query.code || ""),
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      redirect_uri: KICK_REDIRECT_URI,
+      code_verifier: pending.verifier,
+    });
+    const token = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, account);
+    const identity = await identifyKickUser(token.access_token, account);
+    const duplicate = state.kick.accounts.find(a => a.id !== account.id && a.userId && a.userId === identity.userId && a.token?.access_token);
+    if (duplicate) {
+      const msg = "@" + (identity.username || "this Kick account") + " is already connected in " + duplicate.label + ". Sign out/switch Kick accounts in the OAuth browser, then click Connect on " + account.label + " again.";
+      log("Kick duplicate account blocked:", msg);
+      return res.status(409).type("html").send(kickOAuthResultPage(false, msg, account.id));
+    }
     account.token = { ...token, expires_at: token.expires_in ? Date.now() + Number(token.expires_in) * 1000 : 0 };
     account.userId = identity.userId;
     account.username = identity.username;
     state.kick.activeAccountId = account.id;
     saveState();
-    log("Kick connected:", "@" + (identity.username || "unknown"));
-    res.redirect("/?kick=connected");
+    log("Kick connected:", "@" + (identity.username || "unknown") + " → " + account.label);
+    res.type("html").send(kickOAuthResultPage(true, "Connected @" + (identity.username || "unknown") + " to " + account.label + ".", account.id));
   } catch (e) {
-    res.status(500).send("<h2>Kick authorization failed</h2><pre>" + cleanText(e.message || e, 1000).replace(/</g, "&lt;") + "</pre>");
+    res.status(500).type("html").send(kickOAuthResultPage(false, "Kick authorization failed: " + cleanText(e.message || e, 700)));
   }
 });
 
@@ -980,7 +1259,7 @@ app.post("/api/settings", (req, res) => {
   if (body.humanReactionPercent !== undefined) state.settings.humanReactionPercent = Math.round(clamp(body.humanReactionPercent, 0, 100));
   if (body.autoSend !== undefined) state.settings.autoSend = Boolean(body.autoSend);
   if (body.viewerReplies !== undefined) state.settings.viewerReplies = Boolean(body.viewerReplies);
-  if (body.persona !== undefined) state.settings.persona = cleanText(body.persona, 600) || DEFAULT_PERSONA;
+  if (body.persona !== undefined) state.settings.persona = cleanText(body.persona, 600) || BOT_PERSONA;
   if (body.captureFps !== undefined) state.settings.captureFps = [30, 60].includes(Number(body.captureFps)) ? Number(body.captureFps) : 60;
   if (body.visionFps !== undefined) state.settings.visionFps = clamp(body.visionFps, 1, 8);
   if (body.visionWidth !== undefined) state.settings.visionWidth = [720, 960, 1280, 1600].includes(Number(body.visionWidth)) ? Number(body.visionWidth) : 1280;
@@ -1003,22 +1282,7 @@ app.post("/api/context/reset", (_req, res) => {
 });
 app.post("/api/manual-send", async (req, res) => {
   try {
-    const account = activeAccount();
-    if (!account) throw new Error("Select an active co-host account first.");
-    let text = formatOutgoing(req.body?.content || "");
-    if (ENABLE_FINGERPRINT_SPOOFING) text = humanizeChatFormatting(text);
-    if (!text) throw new Error("No message to send.");
-    if (ENABLE_HUMAN_DELAY && account.browserProfile) await sleep(calculateHumanTypingDelay(text, account.browserProfile));
-    const token = await refreshKickToken(account.id);
-    const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
-    const chatUrl = "https://api.kick.com/public/v1/chat";
-    const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
-    if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
-      const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile, proxyUrl: account.proxyUrl || "" });
-      await r.json();
-    } else { await kickJson(chatUrl, chatOpts); }
-    lastReply = text; lastReplyAt = Date.now(); state.metrics.sent++; saveState();
-    log("Manual sent:", text);
+    await postKickChat(req.body?.content || "");
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message || String(e) }); }
 });
@@ -1044,8 +1308,31 @@ app.post("/api/brain", async (req, res) => {
 app.post("/api/realtime-token", async (_req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured.");
-    const sessionConfig = { session: { type: "transcription", audio: { input: { transcription: { model: OPENAI_REALTIME_TRANSCRIBE_MODEL, prompt: "Gaming livestream audio. Accurately transcribe casual speech, game terms, names, slang, and short reactions.", language: "en" }, turn_detection: { type: "server_vad", threshold: 0.48, prefix_padding_ms: 300, silence_duration_ms: 650 } } } } };
-    const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", { method: "POST", headers: { Authorization: "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(sessionConfig) });
+    const sessionConfig = {
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            transcription: {
+              model: OPENAI_REALTIME_TRANSCRIBE_MODEL,
+              prompt: "Gaming livestream audio. Accurately transcribe casual speech, game terms, names, slang, and short reactions.",
+              language: "en",
+            },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.48,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 650,
+            },
+          },
+        },
+      },
+    };
+    const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify(sessionConfig),
+    });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error("Realtime token error (" + r.status + "): " + JSON.stringify(data));
     res.json(data);
@@ -1066,12 +1353,7 @@ header,.card{background:linear-gradient(180deg,#0b1824,#07111a);border:1px solid
 input,select,textarea,button{font:inherit}input,select,textarea{width:100%;background:#03090e;border:1px solid #1a4058;color:#fff;border-radius:9px;padding:9px}textarea{min-height:72px;resize:vertical}button,.btn{border:1px solid #23516a;background:#0b2231;color:#effaff;padding:9px 12px;border-radius:9px;font-weight:800;cursor:pointer;text-decoration:none}.primary{background:#0b88b5;border-color:#1bb7ea}.danger{border-color:#74313d;color:#ffb2be}.small{padding:6px 9px;font-size:11px}.ghost{background:#06131d}
 .label{font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#6e94aa;margin:8px 0 4px}.status{font-size:11px;color:#9ab3c3;min-height:17px;margin-top:6px;word-break:break-word}.big{font-size:19px;font-weight:900}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:#70f0ac}.warn{color:#ffd083}.bad{color:#ff9aaa}
 .chips{display:flex;gap:7px;flex-wrap:wrap}.chip{font-size:9px;font-weight:900;border:1px solid #17384d;border-radius:999px;padding:6px 9px;color:#607f92;background:#061019}.chip.on{color:#cffff0;border-color:#2b8258;background:#09231a}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#375264;margin-right:5px}.chip.on .dot{background:var(--green)}
-.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.disabled{opacity:.5}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctProxy{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca}.acctPersona{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca;min-height:45px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
-.proxyBadge{font-size:9px;font-weight:900;padding:3px 7px;border-radius:6px;margin-top:6px;border:1px solid #17384d;white-space:nowrap}
-.proxyBadge.idle{color:#7692a6;background:#061019}
-.proxyBadge.connected{color:#70f0ac;background:#09231a;border-color:#2b8258}
-.proxyBadge.error{color:#ff9aaa;background:#2a0f16;border-color:#74313d}
-.proxyBadge.testing{color:#ffd083;background:#231e09;border-color:#735b23}
+.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.acctFlags{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}.miniFlag{font-size:8px;border:1px solid #234257;border-radius:999px;padding:3px 6px}.acctStyle{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.acctStyle input,.acctStyle select{font-size:10px;padding:7px}.proxyRow{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:5px;margin-top:7px}.proxyRow input{font-size:10px;padding:7px}
 .rangeWrap{display:grid;grid-template-columns:1fr 56px;gap:8px;align-items:center}input[type=range]{padding:0}.pct{font-weight:900;text-align:center;border:1px solid #1a4058;border-radius:8px;padding:6px;background:#02080d}.toggle{display:flex;align-items:center;gap:7px;font-size:11px;color:#a5bdca}.toggle input{width:auto}
 .preview{width:100%;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:11px;margin-top:9px;border:1px solid #173044}.feed{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:9px;max-height:230px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.4}.reply{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:11px;min-height:47px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}.stat{border:1px solid #15364b;background:#040c12;border-radius:9px;padding:9px}.stat b{display:block;font-size:17px}.stat span{font-size:8px;color:#668aa0}.activityTop{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:9px}
 @media(max-width:900px){.span6{grid-column:1/-1}.sectionGrid,.grid2,.grid4,.activityTop{grid-template-columns:1fr}.accounts{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}}
@@ -1088,7 +1370,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
   <div class="sectionGrid">
     <div>
       <div class="row"><div class="big">Co-host Accounts</div><button id="addAccount" class="small primary">+ Add Account</button><span id="accountLimit" class="status"></span></div>
-      <div class="status">You can connect up to 10 accounts. Each has its own independent brain & persona. Select/deselect accounts to chat.</div>
+      <div class="status">You can connect up to 10 accounts. One account is selected as the active sender at a time. Each slot can also have its own HTTP/HTTPS/SOCKS5 proxy.</div>
       <div id="accounts" class="accounts"></div>
     </div>
     <div>
@@ -1110,7 +1392,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
     <div><div class="label">Per-stream budget</div><div class="rangeWrap"><input id="streamBudget" type="range" min="5" max="50" step="1"><div id="streamBudgetPct" class="pct">$20</div></div></div>
     <div><div class="label">Estimated cost</div><div id="costMeter" class="pct">$0.00 / $20</div><div id="costState" class="status">Normal vision</div></div>
   </div>
-  <div class="label">Global Persona</div><textarea id="persona"></textarea>
+  <div class="label">Persona</div><textarea id="persona"></textarea>
   <div class="row"><label class="toggle"><input id="autoSend" type="checkbox"> Auto send</label><label class="toggle"><input id="viewerReplies" type="checkbox"> Viewer replies</label><button id="saveSettings" class="small primary">Save</button><button id="resetContext" class="small">Reset Context</button></div>
   <div id="brainSettingsState" class="status"></div>
 </section>
@@ -1155,50 +1437,68 @@ function renderAccounts(k){
   const list=k.accounts||[];
   $("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);
   $("addAccount").disabled=list.length>=(k.maxAccounts||10);
+  if(document.activeElement?.matches?.('#accounts input, #accounts textarea, #accounts select'))return;
   $("accounts").innerHTML=list.map(a=>{
-    const statusClass = a.proxyStatus || 'idle';
-    const statusText = a.proxyStatus === 'connected' ? '🟢 Connected' : a.proxyStatus === 'error' ? '🔴 Error' : a.proxyStatus === 'testing' ? '🟡 Testing...' : '⚪ Idle';
-    const displayProxy = a.proxyUrl ? a.proxyUrl.replace(/^socks5:\/\//, '') : '';
-    const isEnabled = a.enabled !== false;
-    return '<div class="acct '+(isEnabled?'':'disabled')+'">' +
-      '<div class="acctTop">' +
-        '<div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div>' +
-        '<div class="row" style="gap:4px">' +
-          '<button class="small '+(isEnabled?'primary':'ghost')+' toggleAcct" data-id="'+esc(a.id)+'">'+(isEnabled?'🟢 Active':'⚪ Off')+'</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect slot with OAuth')+'</div>' +
-      '<div style="display:flex;gap:6px;align-items:center">' +
-        '<input class="acctProxy" data-id="'+esc(a.id)+'" placeholder="69.55.49.177:38182" value="'+esc(displayProxy)+'" style="flex:1">' +
-        '<span class="proxyBadge '+statusClass+'">'+statusText+'</span>' +
-      '</div>' +
-      '<textarea class="acctPersona" data-id="'+esc(a.id)+'" placeholder="Account persona...">'+esc(a.persona||'')+'</textarea>' +
-      '<div class="acctBtns">' +
-        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'" target="_blank" rel="noopener noreferrer" title="Opens in new tab">'+(a.connected?'Reconnect':'Connect')+'</a>' +
-        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save Proxy</button>' +
-        '<button class="small savePersona" data-id="'+esc(a.id)+'">Save Persona</button>' +
-        '<button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button>' +
-      '</div>' +
+    const cooldownSec=Math.round(Number(a.cooldownMs||12000)/1000);
+    const cooldownLeft=Math.ceil(Number(a.cooldownRemainingMs||0)/1000);
+    const proxyTest=a.proxyTest?(a.proxyTest.ok?('Proxy test: connected'+(a.proxyTest.latencyMs?(' • '+a.proxyTest.latencyMs+'ms'):'')+(a.proxyTest.ip?(' • '+a.proxyTest.ip):'')):('Proxy test failed: '+(a.proxyTest.error||'unknown error'))):'Proxy not tested yet';
+    return '<div class="acct '+(a.active?'active':'')+'">'+
+      '<div class="acctTop"><div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div><div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div></div>'+
+      '<div class="acctFlags">'+
+        '<span class="miniFlag '+(a.connected?'ok':'warn')+'">'+(a.connected?'Connected':'Not connected')+'</span>'+
+        '<span class="miniFlag '+(a.tokenValid?'ok':'warn')+'">'+(a.tokenValid?'Token valid':'Token unavailable')+'</span>'+
+        '<span class="miniFlag '+(a.proxyConfigured?'ok':'warn')+'">'+(a.proxyConfigured?'Proxy set':'Direct')+'</span>'+
+        '<span class="miniFlag '+(a.personaSaved?'ok':'warn')+'">'+(a.personaSaved?'Persona saved':'Global persona')+'</span>'+
+      '</div>'+
+      '<div class="acctMeta">Last message: '+ago(a.lastMessageAt)+' • this stream: '+Number(a.messagesThisStream||0)+' • cooldown: '+(cooldownLeft>0?(cooldownLeft+'s left'):'ready')+'</div>'+
+      '<div class="label">Account persona</div><textarea class="accountPersonaInput" data-id="'+esc(a.id)+'" placeholder="Leave blank to use the global persona">'+esc(a.persona||'')+'</textarea>'+
+      '<div class="acctStyle">'+
+        '<div><div class="label">Chattiness %</div><input class="acctChatty" type="number" min="0" max="100" value="'+Number(a.chattinessPercent??50)+'"></div>'+
+        '<div><div class="label">Viewer reply %</div><input class="acctViewerPct" type="number" min="0" max="100" value="'+Number(a.viewerReplyPercent??25)+'"></div>'+
+        '<div><div class="label">Max message chars</div><input class="acctMaxChars" type="number" min="20" max="500" value="'+Number(a.maxMessageLength??140)+'"></div>'+
+        '<div><div class="label">Cooldown seconds</div><input class="acctCooldown" type="number" min="3" max="300" value="'+cooldownSec+'"></div>'+
+        '<div><div class="label">Emoji level</div><select class="acctEmoji"><option value="none" '+(a.emojiLevel==='none'?'selected':'')+'>None</option><option value="low" '+(a.emojiLevel==='low'?'selected':'')+'>Low</option><option value="normal" '+(a.emojiLevel==='normal'?'selected':'')+'>Normal</option></select></div>'+
+        '<div><div class="label">Slang level</div><select class="acctSlang"><option value="none" '+(a.slangLevel==='none'?'selected':'')+'>None</option><option value="low" '+(a.slangLevel==='low'?'selected':'')+'>Low</option><option value="normal" '+(a.slangLevel==='normal'?'selected':'')+'>Normal</option><option value="high" '+(a.slangLevel==='high'?'selected':'')+'>High</option></select></div>'+
+      '</div>'+
+      '<label class="toggle" style="margin-top:7px"><input class="acctMention" type="checkbox" '+(a.mentionUsers?'checked':'')+'> @username viewers when replying</label>'+
+      '<div class="acctBtns"><button class="small primary saveAccountStyle" data-id="'+esc(a.id)+'">Save account settings</button></div>'+
+      '<div class="acctMeta">Proxy: '+esc(a.proxyConfigured?(a.proxyDisplay||'configured'):'direct')+'</div>'+
+      '<div class="proxyRow"><input class="proxyInput" data-id="'+esc(a.id)+'" placeholder="http://user:pass@host:port or socks5://user:pass@host:port"><button class="small saveProxy" data-id="'+esc(a.id)+'">Save proxy</button><button class="small testProxy" data-id="'+esc(a.id)+'">Test</button><button class="small clearProxy" data-id="'+esc(a.id)+'">Clear</button></div>'+
+      '<div class="acctMeta '+(a.proxyTest?.ok?'ok':(a.proxyTest?'bad':''))+'">'+esc(proxyTest)+'</div>'+
+      '<div class="acctBtns"><button class="small primary connectAcct" data-id="'+esc(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</button><button class="small useAcct" data-id="'+esc(a.id)+'">Use</button><button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button><button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button></div>'+
     '</div>';
   }).join('')||'<div class="status">No account slots yet. Click + Add Account.</div>';
 }
+function openKickOAuth(accountId){const w=760,h=780,left=Math.max(0,(screen.width-w)/2),top=Math.max(0,(screen.height-h)/2);const url='/auth/kick/start?accountId='+encodeURIComponent(accountId);const pop=window.open(url,'kick_oauth_'+accountId,'popup=yes,width='+w+',height='+h+',left='+left+',top='+top+',resizable=yes,scrollbars=yes');if(!pop)location.href=url}
 function bindAccountButtons(){
-  $("accounts").querySelectorAll(".toggleAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/toggle",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".connectAcct").forEach(b=>b.onclick=()=>openKickOAuth(b.dataset.id));
+  $("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".saveAccountStyle").forEach(b=>b.onclick=async()=>{
+    try{
+      const card=b.closest('.acct');
+      await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/style",{method:"POST",body:JSON.stringify({
+        persona:card.querySelector('.accountPersonaInput').value,
+        chattinessPercent:Number(card.querySelector('.acctChatty').value),
+        viewerReplyPercent:Number(card.querySelector('.acctViewerPct').value),
+        maxMessageLength:Number(card.querySelector('.acctMaxChars').value),
+        cooldownSeconds:Number(card.querySelector('.acctCooldown').value),
+        emojiLevel:card.querySelector('.acctEmoji').value,
+        slangLevel:card.querySelector('.acctSlang').value,
+        mentionUsers:card.querySelector('.acctMention').checked
+      })});
+      await loadStatus();
+    }catch(e){alert(e.message)}
+  });
+  $("accounts").querySelectorAll(".saveProxy").forEach(b=>b.onclick=async()=>{try{const input=b.closest('.acct').querySelector('.proxyInput');await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxy:input.value.trim()})});input.value='';await loadStatus()}catch(e){alert(e.message)}});
+  $("accounts").querySelectorAll(".testProxy").forEach(b=>b.onclick=async()=>{try{b.disabled=true;b.textContent='Testing...';await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy-test",{method:"POST",body:"{}"});await loadStatus()}catch(e){await loadStatus();alert(e.message)}finally{b.disabled=false;b.textContent='Test'}});
+  $("accounts").querySelectorAll(".clearProxy").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxy:''})});await loadStatus()});
   $("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()});
-  $("accounts").querySelectorAll(".saveProxy").forEach(b=>b.onclick=async()=>{
-    const input = $("accounts").querySelector('input.acctProxy[data-id="'+b.dataset.id+'"]');
-    await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxyUrl:input?.value||""})});
-    await loadStatus();
-  });
-  $("accounts").querySelectorAll(".savePersona").forEach(b=>b.onclick=async()=>{
-    const area = $("accounts").querySelector('textarea.acctPersona[data-id="'+b.dataset.id+'"]');
-    await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/persona",{method:"POST",body:JSON.stringify({persona:area?.value||""})});
-    await loadStatus();
-  });
 }
-function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt);$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
+window.addEventListener('message',e=>{if(e.origin!==location.origin||e.data?.type!=='kick-oauth-complete')return;if(e.data.ok)loadStatus()});
+function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt)+' • active sender '+(k.activeUsername?('@'+k.activeUsername):'none');$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
 async function loadStatus(){try{render(await jf('/api/status'))}catch(e){$('logFeed').textContent='Status error: '+e.message}}
-$('addAccount').onclick=async()=>{try{const d=await jf('/api/accounts/add',{method:'POST',body:'{}'});location.href='/auth/kick/start?accountId='+encodeURIComponent(d.accountId)}catch(e){$('accountLimit').textContent=e.message}};
+$('addAccount').onclick=async()=>{try{await jf('/api/accounts/add',{method:'POST',body:'{}'});await loadStatus()}catch(e){$('accountLimit').textContent=e.message}};
 $('reaction').oninput=()=>$('reactionPct').textContent=$('reaction').value+'%';
 $('streamBudget').oninput=()=>$('streamBudgetPct').textContent='$'+$('streamBudget').value;
 async function saveSettings(){try{await jf('/api/settings',{method:'POST',body:JSON.stringify({provider:$('provider').value,humanReactionPercent:Number($('reaction').value),autoSend:$('autoSend').checked,viewerReplies:$('viewerReplies').checked,persona:$('persona').value,captureFps:Number($('captureFps').value),visionFps:Number($('visionFps').value),visionWidth:Number($('visionWidth').value),visionBurstFrames:Number($('visionBurstFrames').value),streamBudgetDollars:Number($('streamBudget').value)})});$('brainSettingsState').textContent='Saved';await loadStatus()}catch(e){$('brainSettingsState').textContent=e.message}}
@@ -1227,10 +1527,10 @@ loadStatus();setInterval(loadStatus,3000);setInterval(()=>on('chipVision',runnin
 app.get("/", (_req, res) => res.type("html").send(DASHBOARD_HTML));
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log("AI Co-host — per-account personas & active toggle running on port " + PORT);
+  console.log("AI Co-host rework 2.2 auth + ordered realtime transcript pipeline running on port " + PORT);
   console.log("Brain providers: Sonnet 5=" + (ANTHROPIC_API_KEY ? "configured" : "missing key") + " • OpenAI=" + (OPENAI_API_KEY ? "configured" : "missing key"));
 });
 
 setInterval(() => queryStreamSession().catch(() => {}), 60000).unref();
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)))
+process.on("SIGINT", () => server.close(() => process.exit(0)));
