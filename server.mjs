@@ -1178,7 +1178,15 @@ function kickOAuthResultPage(ok, message, accountId = "") {
   const safeMessage = cleanText(message || "", 800);
   const payload = JSON.stringify({ type: "kick-oauth-complete", ok: Boolean(ok), accountId: String(accountId || ""), message: safeMessage }).replace(/</g, "\\u003c");
   const title = ok ? "Kick account connected" : "Kick account not connected";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:30px}div{max-width:620px;margin:10vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:22px}a{color:#55d6ff}</style></head><body><div><h2>${title}</h2><p>${safeMessage.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</p><p><a href="/">Return to dashboard</a></p></div><script>try{if(window.opener&&!window.opener.closed)window.opener.postMessage(${payload},location.origin)}catch(e){}${ok ? 'setTimeout(()=>window.close(),700);' : ''}</script></body></html>`;
+  const retry = !ok && accountId ? `<p><a href="https://kick.com/" target="_blank" rel="noopener">Open Kick to switch/logout account</a></p><p><a href="/auth/kick/start?accountId=${encodeURIComponent(String(accountId))}">Retry this account slot</a></p>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:30px}div{max-width:620px;margin:10vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:22px}a{color:#55d6ff}</style></head><body><div><h2>${title}</h2><p>${safeMessage.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</p>${retry}<p><a href="/">Return to dashboard</a></p></div><script>try{if(window.opener&&!window.opener.closed)window.opener.postMessage(${payload},location.origin)}catch(e){}${ok ? 'setTimeout(()=>window.close(),700);' : ''}</script></body></html>`;
+}
+
+function kickSwitchAccountPage(account) {
+  const accountId = String(account?.id || "");
+  const label = cleanText(account?.label || "this account slot", 80).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const continueUrl = "/auth/kick/start?accountId=" + encodeURIComponent(accountId) + "&switched=1";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Switch Kick account</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:24px}.box{max-width:620px;margin:7vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:24px}h2{margin-top:0}.steps{line-height:1.65;color:#c9ddea}.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}a.btn{display:inline-block;padding:11px 15px;border-radius:9px;text-decoration:none;font-weight:800}.kick{background:#53fc18;color:#041006}.go{background:#1286b2;color:white}.note{font-size:12px;color:#86a3b8;margin-top:18px}</style></head><body><div class="box"><h2>Connect a different Kick account to ${label}</h2><div class="steps">Kick is currently reusing whichever Kick account is already signed in to this browser.<br><br><b>1.</b> Click <b>Open Kick</b> below.<br><b>2.</b> Log out of the currently signed-in Kick account.<br><b>3.</b> Log in to the different Kick account you want for ${label}.<br><b>4.</b> Come back to this window and click <b>Continue OAuth</b>.</div><div class="btns"><a class="btn kick" href="https://kick.com/" target="_blank" rel="noopener">Open Kick</a><a class="btn go" href="${continueUrl}">Continue OAuth</a></div><div class="note">A new account slot cannot create a separate Kick browser login session by itself. This step prevents accidentally reconnecting the same Kick account.</div></div></body></html>`;
 }
 
 app.get("/auth/kick/start", (req, res) => {
@@ -1187,6 +1195,10 @@ app.get("/auth/kick/start", (req, res) => {
     const accountId = String(req.query.accountId || state.kick.activeAccountId || "");
     const account = state.kick.accounts.find(a => a.id === accountId);
     if (!account) throw new Error("Add an account slot first.");
+    const otherConnected = state.kick.accounts.some(a => a.id !== account.id && Boolean(a.token?.access_token));
+    if (!account.token?.access_token && otherConnected && String(req.query.switched || "") !== "1") {
+      return res.type("html").send(kickSwitchAccountPage(account));
+    }
     const verifier = crypto.randomBytes(48).toString("base64url");
     const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
     const oauthState = crypto.randomBytes(24).toString("base64url");
