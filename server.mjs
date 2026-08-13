@@ -912,7 +912,7 @@ app.get("/auth/kick/start", (req, res) => {
     const oauthState = crypto.randomBytes(24).toString("base64url");
     oauthPending.set(oauthState, { verifier, accountId, createdAt: Date.now() });
     for (const [key, value] of oauthPending) if (Date.now() - value.createdAt > 10 * 60 * 1000) oauthPending.delete(key);
-    const qs = new URLSearchParams({ response_type: "code", client_id: KICK_CLIENT_ID, redirect_uri: KICK_REDIRECT_URI, scope: "user:read channel:read chat:write", state: oauthState, code_challenge: challenge, code_challenge_method: "S256" });
+    const qs = new URLSearchParams({ response_type: "code", client_id: KICK_CLIENT_ID, redirect_uri: KICK_REDIRECT_URI, scope: "user:read channel:read chat:write", state: oauthState, code_challenge: challenge, code_challenge_method: "S256", prompt: "login" });
     res.redirect("https://id.kick.com/oauth/authorize?" + qs.toString());
   } catch (e) {
     res.status(500).send("Kick authorization error: " + cleanText(e.message || e, 500));
