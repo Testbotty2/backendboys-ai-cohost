@@ -5,7 +5,6 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
-import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { buildBrowserProfile, calculateHumanTypingDelay, humanizeChatFormatting, impersonatedFetch, tlsImpersonationStatus } from "./fingerprint.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,40 +41,6 @@ const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLo
 const ANON_FINGERPRINT = ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("kick-api-anonymous") : null;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// Standard per-account proxy routing. This is independent of the existing fingerprint module.
-const proxyDispatchers = new Map();
-function normalizeProxyUrl(value) {
-  let raw = String(value || "").trim();
-  if (!raw) return "";
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = "http://" + raw;
-  raw = raw.replace(/^socks5h:\/\//i, "socks5://");
-  const u = new URL(raw);
-  if (!["http:", "https:", "socks:", "socks5:"].includes(u.protocol)) throw new Error("Proxy must use http://, https://, socks://, or socks5://");
-  if (!u.hostname || !u.port) throw new Error("Proxy must include host and port.");
-  return u.toString();
-}
-function proxyDisplay(value) {
-  if (!value) return "direct";
-  try {
-    const u = new URL(value);
-    return u.protocol + "//" + u.hostname + ":" + u.port;
-  } catch { return "configured"; }
-}
-function getProxyDispatcher(proxyUrl) {
-  const key = String(proxyUrl || "");
-  if (!key) return null;
-  let dispatcher = proxyDispatchers.get(key);
-  if (!dispatcher) {
-    dispatcher = new ProxyAgent(key);
-    proxyDispatchers.set(key, dispatcher);
-  }
-  return dispatcher;
-}
-async function accountProxyFetch(account, url, options = {}) {
-  if (!account?.proxy) return null;
-  return undiciFetch(url, { ...options, dispatcher: getProxyDispatcher(account.proxy) });
-}
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const app = express();
@@ -201,7 +166,6 @@ function newAccount(label = "") {
     token: null,
     userId: "",
     username: "",
-    proxy: "",
     browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(id) : null,
     createdAt: Date.now(),
   };
@@ -223,7 +187,6 @@ function loadState() {
           token: item.tokenEncrypted ? unseal(item.tokenEncrypted) : (item.token || null),
           userId: String(item.userId || ""),
           username: String(item.username || ""),
-          proxy: item.proxyEncrypted ? String(unseal(item.proxyEncrypted) || "") : String(item.proxy || ""),
           browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(item.id || "anon") : null,
           createdAt: Number(item.createdAt || Date.now()),
         });
@@ -235,7 +198,6 @@ function loadState() {
         token: rawKick.tokenEncrypted ? unseal(rawKick.tokenEncrypted) : (rawKick.token || null),
         userId: String(rawKick.userId || ""),
         username: String(rawKick.username || ""),
-        proxy: "",
         browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("legacy-account-1") : null,
         createdAt: Date.now(),
       });
@@ -263,8 +225,6 @@ function saveState() {
     ...account,
     tokenEncrypted: seal(account.token),
     token: undefined,
-    proxyEncrypted: seal(account.proxy),
-    proxy: undefined,
     browserProfile: undefined, // regenerable from account.id
   }));
   fs.writeFileSync(STATE_FILE, JSON.stringify(snapshot, null, 2));
@@ -421,8 +381,6 @@ function publicStatus() {
         connected: Boolean(a.token?.access_token),
         username: a.username,
         userId: a.userId,
-        proxyConfigured: Boolean(a.proxy),
-        proxyDisplay: proxyDisplay(a.proxy),
         active: a.id === state.kick.activeAccountId,
       })),
       broadcasterId: state.kick.broadcasterId,
@@ -455,11 +413,9 @@ function publicStatus() {
   };
 }
 
-async function kickJson(url, options = {}, account = null) {
+async function kickJson(url, options = {}) {
   let r;
-  if (account?.proxy) {
-    r = await accountProxyFetch(account, url, options);
-  } else if (ENABLE_FINGERPRINT_SPOOFING && ANON_FINGERPRINT) {
+  if (ENABLE_FINGERPRINT_SPOOFING && ANON_FINGERPRINT) {
     r = await impersonatedFetch(null, url, options, { profile: ANON_FINGERPRINT });
   } else {
     r = await fetch(url, options);
@@ -476,8 +432,8 @@ async function getKickAppToken() {
   kickAppToken = { ...data, expiresAt: data.expires_in ? Date.now() + Number(data.expires_in) * 1000 : 0 };
   return data.access_token;
 }
-async function identifyKickUser(accessToken, account = null) {
-  const data = await kickJson("https://api.kick.com/public/v1/users", { headers: { Authorization: "Bearer " + accessToken, Accept: "application/json" } }, account);
+async function identifyKickUser(accessToken) {
+  const data = await kickJson("https://api.kick.com/public/v1/users", { headers: { Authorization: "Bearer " + accessToken, Accept: "application/json" } });
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   return { userId: String(item?.user_id || item?.id || ""), username: String(item?.name || item?.username || item?.slug || "") };
 }
@@ -492,7 +448,7 @@ async function refreshKickToken(accountId = state.kick.activeAccountId) {
     client_id: KICK_CLIENT_ID,
     client_secret: KICK_CLIENT_SECRET,
   });
-  const data = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, account);
+  const data = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
   account.token = { ...data, expires_at: data.expires_in ? Date.now() + Number(data.expires_in) * 1000 : 0 };
   saveState();
   return account.token;
@@ -501,8 +457,7 @@ async function resolveChannel(slug) {
   const token = await refreshKickToken();
   const clean = cleanText(slug, 100);
   if (!clean) throw new Error("Enter the streamer Kick username.");
-  const account = activeAccount();
-  const data = await kickJson("https://api.kick.com/public/v1/channels?slug=" + encodeURIComponent(clean), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } }, account);
+  const data = await kickJson("https://api.kick.com/public/v1/channels?slug=" + encodeURIComponent(clean), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } });
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   const id = String(item?.broadcaster_user_id || "");
   if (!id) throw new Error("Kick returned no broadcaster_user_id.");
@@ -516,8 +471,7 @@ async function resolveChannel(slug) {
 async function queryStreamSession() {
   if (!state.kick.broadcasterId || !activeAccount()?.token?.access_token) return streamSession;
   const token = await refreshKickToken();
-  const account = activeAccount();
-  const data = await kickJson("https://api.kick.com/public/v1/channels?broadcaster_user_id=" + encodeURIComponent(state.kick.broadcasterId), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } }, account);
+  const data = await kickJson("https://api.kick.com/public/v1/channels?broadcaster_user_id=" + encodeURIComponent(state.kick.broadcasterId), { headers: { Authorization: "Bearer " + token.access_token, Accept: "application/json" } });
   const item = Array.isArray(data?.data) ? data.data[0] : data?.data;
   const stream = item?.stream || {};
   const isLive = Boolean(stream?.is_live);
@@ -568,9 +522,7 @@ async function postKickChat(content, replyToMessageId = "") {
   };
 
   let data;
-  if (account.proxy) {
-    data = await kickJson(chatUrl, chatOpts, account);
-  } else if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
+  if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
     const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile });
     data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
@@ -878,19 +830,6 @@ app.post("/api/accounts/:id/active", (req, res) => {
   log("Active sender:", account.username ? "@" + account.username : account.label);
   res.json({ ok: true });
 });
-app.post("/api/accounts/:id/proxy", (req, res) => {
-  try {
-    const account = state.kick.accounts.find(a => a.id === req.params.id);
-    if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-    const next = normalizeProxyUrl(req.body?.proxy || "");
-    account.proxy = next;
-    saveState();
-    log("Account proxy:", (account.username ? "@" + account.username : account.label) + " → " + proxyDisplay(next));
-    res.json({ ok: true, configured: Boolean(next), display: proxyDisplay(next) });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || String(e) });
-  }
-});
 app.post("/api/accounts/:id/disconnect", (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
@@ -908,13 +847,6 @@ app.delete("/api/accounts/:id", (req, res) => {
   saveState();
   res.json({ ok: true });
 });
-
-function kickOAuthResultPage(ok, message, accountId = "") {
-  const safeMessage = cleanText(message || "", 800);
-  const payload = JSON.stringify({ type: "kick-oauth-complete", ok: Boolean(ok), accountId: String(accountId || ""), message: safeMessage }).replace(/</g, "\\u003c");
-  const title = ok ? "Kick account connected" : "Kick account not connected";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:30px}div{max-width:620px;margin:10vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:22px}a{color:#55d6ff}</style></head><body><div><h2>${title}</h2><p>${safeMessage.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</p><p><a href="/">Return to dashboard</a></p></div><script>try{if(window.opener&&!window.opener.closed)window.opener.postMessage(${payload},location.origin)}catch(e){}${ok ? 'setTimeout(()=>window.close(),700);' : ''}</script></body></html>`;
-}
 
 app.get("/auth/kick/start", (req, res) => {
   try {
@@ -957,23 +889,17 @@ app.get("/auth/kick/callback", async (req, res) => {
       redirect_uri: KICK_REDIRECT_URI,
       code_verifier: pending.verifier,
     });
-    const token = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, account);
-    const identity = await identifyKickUser(token.access_token, account);
-    const duplicate = state.kick.accounts.find(a => a.id !== account.id && a.userId && a.userId === identity.userId && a.token?.access_token);
-    if (duplicate) {
-      const msg = "@" + (identity.username || "this Kick account") + " is already connected in " + duplicate.label + ". Sign out/switch Kick accounts in the OAuth browser, then click Connect on " + account.label + " again.";
-      log("Kick duplicate account blocked:", msg);
-      return res.status(409).type("html").send(kickOAuthResultPage(false, msg, account.id));
-    }
+    const token = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+    const identity = await identifyKickUser(token.access_token);
     account.token = { ...token, expires_at: token.expires_in ? Date.now() + Number(token.expires_in) * 1000 : 0 };
     account.userId = identity.userId;
     account.username = identity.username;
     state.kick.activeAccountId = account.id;
     saveState();
-    log("Kick connected:", "@" + (identity.username || "unknown") + " → " + account.label);
-    res.type("html").send(kickOAuthResultPage(true, "Connected @" + (identity.username || "unknown") + " to " + account.label + ".", account.id));
+    log("Kick connected:", "@" + (identity.username || "unknown"));
+    res.redirect("/?kick=connected");
   } catch (e) {
-    res.status(500).type("html").send(kickOAuthResultPage(false, "Kick authorization failed: " + cleanText(e.message || e, 700)));
+    res.status(500).send("<h2>Kick authorization failed</h2><pre>" + cleanText(e.message || e, 1000).replace(/</g, "&lt;") + "</pre>");
   }
 });
 
@@ -1088,7 +1014,7 @@ header,.card{background:linear-gradient(180deg,#0b1824,#07111a);border:1px solid
 input,select,textarea,button{font:inherit}input,select,textarea{width:100%;background:#03090e;border:1px solid #1a4058;color:#fff;border-radius:9px;padding:9px}textarea{min-height:72px;resize:vertical}button,.btn{border:1px solid #23516a;background:#0b2231;color:#effaff;padding:9px 12px;border-radius:9px;font-weight:800;cursor:pointer;text-decoration:none}.primary{background:#0b88b5;border-color:#1bb7ea}.danger{border-color:#74313d;color:#ffb2be}.small{padding:6px 9px;font-size:11px}.ghost{background:#06131d}
 .label{font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#6e94aa;margin:8px 0 4px}.status{font-size:11px;color:#9ab3c3;min-height:17px;margin-top:6px;word-break:break-word}.big{font-size:19px;font-weight:900}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:#70f0ac}.warn{color:#ffd083}.bad{color:#ff9aaa}
 .chips{display:flex;gap:7px;flex-wrap:wrap}.chip{font-size:9px;font-weight:900;border:1px solid #17384d;border-radius:999px;padding:6px 9px;color:#607f92;background:#061019}.chip.on{color:#cffff0;border-color:#2b8258;background:#09231a}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#375264;margin-right:5px}.chip.on .dot{background:var(--green)}
-.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.proxyRow{display:grid;grid-template-columns:1fr auto auto;gap:5px;margin-top:7px}.proxyRow input{font-size:10px;padding:7px}
+.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
 .rangeWrap{display:grid;grid-template-columns:1fr 56px;gap:8px;align-items:center}input[type=range]{padding:0}.pct{font-weight:900;text-align:center;border:1px solid #1a4058;border-radius:8px;padding:6px;background:#02080d}.toggle{display:flex;align-items:center;gap:7px;font-size:11px;color:#a5bdca}.toggle input{width:auto}
 .preview{width:100%;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:11px;margin-top:9px;border:1px solid #173044}.feed{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:9px;max-height:230px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.4}.reply{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:11px;min-height:47px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}.stat{border:1px solid #15364b;background:#040c12;border-radius:9px;padding:9px}.stat b{display:block;font-size:17px}.stat span{font-size:8px;color:#668aa0}.activityTop{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:9px}
 @media(max-width:900px){.span6{grid-column:1/-1}.sectionGrid,.grid2,.grid4,.activityTop{grid-template-columns:1fr}.accounts{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}}
@@ -1105,7 +1031,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
   <div class="sectionGrid">
     <div>
       <div class="row"><div class="big">Co-host Accounts</div><button id="addAccount" class="small primary">+ Add Account</button><span id="accountLimit" class="status"></span></div>
-      <div class="status">You can connect up to 10 accounts. One account is selected as the active sender at a time. Each slot can also have its own HTTP/HTTPS/SOCKS5 proxy.</div>
+      <div class="status">You can connect up to 10 accounts. One account is selected as the active sender at a time.</div>
       <div id="accounts" class="accounts"></div>
     </div>
     <div>
@@ -1168,13 +1094,11 @@ function ago(ms){if(!ms)return "never";const s=Math.max(0,Math.floor((Date.now()
 function fmtUptime(s){s=Number(s||0);const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?h+"h "+m+"m":m+"m"}
 function esc(s){return String(s||"").replace(/[&<>\"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))}
 function brainText(b){if(!b)return "No decision yet.";return ["provider: "+b.provider,"human reaction: "+b.score+"%","threshold: "+b.threshold+"%","decision: "+(b.shouldReply?"REPLY":"QUIET"),"reason: "+(b.reason||""),"reply: "+(b.reply||"(none)")].join("\n")}
-function renderAccounts(k){const list=k.accounts||[];$("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);$("addAccount").disabled=list.length>=(k.maxAccounts||10);$("accounts").innerHTML=list.map(a=>'<div class="acct '+(a.active?'active':'')+'"><div class="acctTop"><div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div><div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div></div><div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div><div class="acctMeta">Proxy: '+esc(a.proxyConfigured?(a.proxyDisplay||'configured'):'direct')+'</div><div class="proxyRow"><input class="proxyInput" data-id="'+esc(a.id)+'" placeholder="http://user:pass@host:port or socks5://user:pass@host:port"><button class="small saveProxy" data-id="'+esc(a.id)+'">Save proxy</button><button class="small clearProxy" data-id="'+esc(a.id)+'">Clear</button></div><div class="acctBtns"><button class="small primary connectAcct" data-id="'+esc(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</button><button class="small useAcct" data-id="'+esc(a.id)+'">Use</button><button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button><button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button></div></div>').join('')||'<div class="status">No account slots yet. Click + Add Account.</div>'}
-function openKickOAuth(accountId){const w=760,h=780,left=Math.max(0,(screen.width-w)/2),top=Math.max(0,(screen.height-h)/2);const url='/auth/kick/start?accountId='+encodeURIComponent(accountId);const pop=window.open(url,'kick_oauth_'+accountId,'popup=yes,width='+w+',height='+h+',left='+left+',top='+top+',resizable=yes,scrollbars=yes');if(!pop)location.href=url}
-function bindAccountButtons(){$("accounts").querySelectorAll(".connectAcct").forEach(b=>b.onclick=()=>openKickOAuth(b.dataset.id));$("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".saveProxy").forEach(b=>b.onclick=async()=>{try{const input=b.closest('.acct').querySelector('.proxyInput');await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxy:input.value.trim()})});input.value='';await loadStatus()}catch(e){alert(e.message)}});$("accounts").querySelectorAll(".clearProxy").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxy:''})});await loadStatus()});$("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()})}
-window.addEventListener('message',e=>{if(e.origin!==location.origin||e.data?.type!=='kick-oauth-complete')return;if(e.data.ok)loadStatus()});
+function renderAccounts(k){const list=k.accounts||[];$("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);$("addAccount").disabled=list.length>=(k.maxAccounts||10);$("accounts").innerHTML=list.map(a=>'<div class="acct '+(a.active?'active':'')+'"><div class="acctTop"><div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div><div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div></div><div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div><div class="acctBtns"><a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</a><button class="small useAcct" data-id="'+esc(a.id)+'">Use</button><button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button><button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button></div></div>').join('')||'<div class="status">No account slots yet. Click + Add Account.</div>'}
+function bindAccountButtons(){$("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()})}
 function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt)+' • active sender '+(k.activeUsername?('@'+k.activeUsername):'none');$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
 async function loadStatus(){try{render(await jf('/api/status'))}catch(e){$('logFeed').textContent='Status error: '+e.message}}
-$('addAccount').onclick=async()=>{try{await jf('/api/accounts/add',{method:'POST',body:'{}'});await loadStatus()}catch(e){$('accountLimit').textContent=e.message}};
+$('addAccount').onclick=async()=>{try{const d=await jf('/api/accounts/add',{method:'POST',body:'{}'});location.href='/auth/kick/start?accountId='+encodeURIComponent(d.accountId)}catch(e){$('accountLimit').textContent=e.message}};
 $('reaction').oninput=()=>$('reactionPct').textContent=$('reaction').value+'%';
 $('streamBudget').oninput=()=>$('streamBudgetPct').textContent='$'+$('streamBudget').value;
 async function saveSettings(){try{await jf('/api/settings',{method:'POST',body:JSON.stringify({provider:$('provider').value,humanReactionPercent:Number($('reaction').value),autoSend:$('autoSend').checked,viewerReplies:$('viewerReplies').checked,persona:$('persona').value,captureFps:Number($('captureFps').value),visionFps:Number($('visionFps').value),visionWidth:Number($('visionWidth').value),visionBurstFrames:Number($('visionBurstFrames').value),streamBudgetDollars:Number($('streamBudget').value)})});$('brainSettingsState').textContent='Saved';await loadStatus()}catch(e){$('brainSettingsState').textContent=e.message}}
