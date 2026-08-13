@@ -166,6 +166,7 @@ function newAccount(label = "") {
     token: null,
     userId: "",
     username: "",
+    proxyUrl: "",
     browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(id) : null,
     createdAt: Date.now(),
   };
@@ -187,6 +188,7 @@ function loadState() {
           token: item.tokenEncrypted ? unseal(item.tokenEncrypted) : (item.token || null),
           userId: String(item.userId || ""),
           username: String(item.username || ""),
+          proxyUrl: String(item.proxyUrl || ""),
           browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(item.id || "anon") : null,
           createdAt: Number(item.createdAt || Date.now()),
         });
@@ -198,6 +200,7 @@ function loadState() {
         token: rawKick.tokenEncrypted ? unseal(rawKick.tokenEncrypted) : (rawKick.token || null),
         userId: String(rawKick.userId || ""),
         username: String(rawKick.username || ""),
+        proxyUrl: "",
         browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("legacy-account-1") : null,
         createdAt: Date.now(),
       });
@@ -381,6 +384,7 @@ function publicStatus() {
         connected: Boolean(a.token?.access_token),
         username: a.username,
         userId: a.userId,
+        proxyUrl: a.proxyUrl || "",
         active: a.id === state.kick.activeAccountId,
       })),
       broadcasterId: state.kick.broadcasterId,
@@ -513,7 +517,7 @@ async function postKickChat(content, replyToMessageId = "") {
   const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
   if (replyToMessageId) payload.reply_to_message_id = String(replyToMessageId);
 
-  // Use account-specific fingerprint for the chat send
+  // Use account-specific fingerprint and individual account proxy for the chat send
   const chatUrl = "https://api.kick.com/public/v1/chat";
   const chatOpts = {
     method: "POST",
@@ -523,7 +527,10 @@ async function postKickChat(content, replyToMessageId = "") {
 
   let data;
   if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
-    const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile });
+    const r = await impersonatedFetch(account, chatUrl, chatOpts, { 
+      profile: account.browserProfile,
+      proxyUrl: account.proxyUrl || "" 
+    });
     data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
   } else {
@@ -839,6 +846,14 @@ app.post("/api/accounts/:id/disconnect", (req, res) => {
   saveState();
   res.json({ ok: true });
 });
+app.post("/api/accounts/:id/proxy", (req, res) => {
+  const account = state.kick.accounts.find(a => a.id === req.params.id);
+  if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
+  account.proxyUrl = String(req.body?.proxyUrl || "").trim();
+  saveState();
+  log("Proxy updated for account " + (account.username || account.label));
+  res.json({ ok: true });
+});
 app.delete("/api/accounts/:id", (req, res) => {
   const before = state.kick.accounts.length;
   state.kick.accounts = state.kick.accounts.filter(a => a.id !== req.params.id);
@@ -851,7 +866,7 @@ app.delete("/api/accounts/:id", (req, res) => {
 app.get("/auth/kick/start", (req, res) => {
   try {
     if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !KICK_REDIRECT_URI) throw new Error("Missing Kick OAuth environment variables.");
-    const accountId = String(req.query.accountId || state.kick.activeAccountId || "");
+    const accountId = String(req.query.accountId || "").trim(); // strict account slot routing
     const account = state.kick.accounts.find(a => a.id === accountId);
     if (!account) throw new Error("Add an account slot first.");
     const verifier = crypto.randomBytes(48).toString("base64url");
@@ -1014,7 +1029,7 @@ header,.card{background:linear-gradient(180deg,#0b1824,#07111a);border:1px solid
 input,select,textarea,button{font:inherit}input,select,textarea{width:100%;background:#03090e;border:1px solid #1a4058;color:#fff;border-radius:9px;padding:9px}textarea{min-height:72px;resize:vertical}button,.btn{border:1px solid #23516a;background:#0b2231;color:#effaff;padding:9px 12px;border-radius:9px;font-weight:800;cursor:pointer;text-decoration:none}.primary{background:#0b88b5;border-color:#1bb7ea}.danger{border-color:#74313d;color:#ffb2be}.small{padding:6px 9px;font-size:11px}.ghost{background:#06131d}
 .label{font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#6e94aa;margin:8px 0 4px}.status{font-size:11px;color:#9ab3c3;min-height:17px;margin-top:6px;word-break:break-word}.big{font-size:19px;font-weight:900}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:#70f0ac}.warn{color:#ffd083}.bad{color:#ff9aaa}
 .chips{display:flex;gap:7px;flex-wrap:wrap}.chip{font-size:9px;font-weight:900;border:1px solid #17384d;border-radius:999px;padding:6px 9px;color:#607f92;background:#061019}.chip.on{color:#cffff0;border-color:#2b8258;background:#09231a}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#375264;margin-right:5px}.chip.on .dot{background:var(--green)}
-.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctProxy{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
 .rangeWrap{display:grid;grid-template-columns:1fr 56px;gap:8px;align-items:center}input[type=range]{padding:0}.pct{font-weight:900;text-align:center;border:1px solid #1a4058;border-radius:8px;padding:6px;background:#02080d}.toggle{display:flex;align-items:center;gap:7px;font-size:11px;color:#a5bdca}.toggle input{width:auto}
 .preview{width:100%;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:11px;margin-top:9px;border:1px solid #173044}.feed{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:9px;max-height:230px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.4}.reply{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:11px;min-height:47px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}.stat{border:1px solid #15364b;background:#040c12;border-radius:9px;padding:9px}.stat b{display:block;font-size:17px}.stat span{font-size:8px;color:#668aa0}.activityTop{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:9px}
 @media(max-width:900px){.span6{grid-column:1/-1}.sectionGrid,.grid2,.grid4,.activityTop{grid-template-columns:1fr}.accounts{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}}
@@ -1094,8 +1109,38 @@ function ago(ms){if(!ms)return "never";const s=Math.max(0,Math.floor((Date.now()
 function fmtUptime(s){s=Number(s||0);const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?h+"h "+m+"m":m+"m"}
 function esc(s){return String(s||"").replace(/[&<>\"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))}
 function brainText(b){if(!b)return "No decision yet.";return ["provider: "+b.provider,"human reaction: "+b.score+"%","threshold: "+b.threshold+"%","decision: "+(b.shouldReply?"REPLY":"QUIET"),"reason: "+(b.reason||""),"reply: "+(b.reply||"(none)")].join("\n")}
-function renderAccounts(k){const list=k.accounts||[];$("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);$("addAccount").disabled=list.length>=(k.maxAccounts||10);$("accounts").innerHTML=list.map(a=>'<div class="acct '+(a.active?'active':'')+'"><div class="acctTop"><div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div><div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div></div><div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div><div class="acctBtns"><a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</a><button class="small useAcct" data-id="'+esc(a.id)+'">Use</button><button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button><button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button></div></div>').join('')||'<div class="status">No account slots yet. Click + Add Account.</div>'}
-function bindAccountButtons(){$("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});$("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()})}
+function renderAccounts(k){
+  const list=k.accounts||[];
+  $("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);
+  $("addAccount").disabled=list.length>=(k.maxAccounts||10);
+  $("accounts").innerHTML=list.map(a=>
+    '<div class="acct '+(a.active?'active':'')+'">' +
+      '<div class="acctTop">' +
+        '<div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div>' +
+        '<div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div>' +
+      '</div>' +
+      '<div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div>' +
+      '<input class="acctProxy" data-id="'+esc(a.id)+'" placeholder="socks5://user:pass@host:port" value="'+esc(a.proxyUrl||'')+'">' +
+      '<div class="acctBtns">' +
+        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</a>' +
+        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save Proxy</button>' +
+        '<button class="small useAcct" data-id="'+esc(a.id)+'">Use</button>' +
+        '<button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button>' +
+        '<button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button>' +
+      '</div>' +
+    '</div>'
+  ).join('')||'<div class="status">No account slots yet. Click + Add Account.</div>';
+}
+function bindAccountButtons(){
+  $("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()});
+  $("accounts").querySelectorAll(".saveProxy").forEach(b=>b.onclick=async()=>{
+    const input = $("accounts").querySelector('input.acctProxy[data-id="'+b.dataset.id+'"]');
+    await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxyUrl:input?.value||""})});
+    await loadStatus();
+  });
+}
 function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt)+' • active sender '+(k.activeUsername?('@'+k.activeUsername):'none');$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
 async function loadStatus(){try{render(await jf('/api/status'))}catch(e){$('logFeed').textContent='Status error: '+e.message}}
 $('addAccount').onclick=async()=>{try{const d=await jf('/api/accounts/add',{method:'POST',body:'{}'});location.href='/auth/kick/start?accountId='+encodeURIComponent(d.accountId)}catch(e){$('accountLimit').textContent=e.message}};
