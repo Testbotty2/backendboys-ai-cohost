@@ -1,22 +1,16 @@
 {
-  "name": "juniors-ai-chat",
-  "version": "10.5.0",
+  "name": "backendboys-ai-cohost-clean",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "patch": "node apply-antidetection.mjs",
     "start": "node server.mjs",
-    "dev": "node apply-antidetection.mjs && node server.mjs"
+    "dev": "node server.mjs"
   },
   "dependencies": {
     "dotenv": "17.4.2",
     "express": "5.2.1",
-    "openai": "6.48.0",
-    "node-fetch": "3.3.2",
-    "https-proxy-agent": "9.1.0",
-    "socks-proxy-agent": "10.1.0",
-    "pg": "8.22.0",
-    "puppeteer": "^23.0.0"
+    "openai": "6.48.0"
   },
   "engines": {
     "node": ">=20"
