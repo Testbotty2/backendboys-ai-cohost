@@ -167,6 +167,7 @@ function newAccount(label = "") {
     userId: "",
     username: "",
     proxyUrl: "",
+    proxyStatus: "idle",
     browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(id) : null,
     createdAt: Date.now(),
   };
@@ -189,6 +190,7 @@ function loadState() {
           userId: String(item.userId || ""),
           username: String(item.username || ""),
           proxyUrl: String(item.proxyUrl || ""),
+          proxyStatus: String(item.proxyStatus || "idle"),
           browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(item.id || "anon") : null,
           createdAt: Number(item.createdAt || Date.now()),
         });
@@ -201,6 +203,7 @@ function loadState() {
         userId: String(rawKick.userId || ""),
         username: String(rawKick.username || ""),
         proxyUrl: "",
+        proxyStatus: "idle",
         browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("legacy-account-1") : null,
         createdAt: Date.now(),
       });
@@ -385,6 +388,7 @@ function publicStatus() {
         username: a.username,
         userId: a.userId,
         proxyUrl: a.proxyUrl || "",
+        proxyStatus: a.proxyStatus || "idle",
         active: a.id === state.kick.activeAccountId,
       })),
       broadcasterId: state.kick.broadcasterId,
@@ -846,13 +850,35 @@ app.post("/api/accounts/:id/disconnect", (req, res) => {
   saveState();
   res.json({ ok: true });
 });
-app.post("/api/accounts/:id/proxy", (req, res) => {
+app.post("/api/accounts/:id/proxy", async (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-  account.proxyUrl = String(req.body?.proxyUrl || "").trim();
+  
+  let raw = String(req.body?.proxyUrl || "").trim();
+  if (raw && !raw.includes("://")) {
+    raw = "socks5://" + raw;
+  }
+  account.proxyUrl = raw;
+
+  if (raw) {
+    try {
+      account.proxyStatus = "testing";
+      saveState();
+      const testRes = await impersonatedFetch(account, "https://api.ipify.org?format=json", { method: "GET" }, {
+        profile: account.browserProfile,
+        proxyUrl: account.proxyUrl
+      });
+      account.proxyStatus = testRes.ok ? "connected" : "error";
+    } catch {
+      account.proxyStatus = "error";
+    }
+  } else {
+    account.proxyStatus = "idle";
+  }
+
   saveState();
-  log("Proxy updated for account " + (account.username || account.label));
-  res.json({ ok: true });
+  log("Proxy status for @" + (account.username || account.label) + ": " + account.proxyStatus);
+  res.json({ ok: true, proxyStatus: account.proxyStatus });
 });
 app.delete("/api/accounts/:id", (req, res) => {
   const before = state.kick.accounts.length;
@@ -1030,6 +1056,11 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
 .label{font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#6e94aa;margin:8px 0 4px}.status{font-size:11px;color:#9ab3c3;min-height:17px;margin-top:6px;word-break:break-word}.big{font-size:19px;font-weight:900}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:#70f0ac}.warn{color:#ffd083}.bad{color:#ff9aaa}
 .chips{display:flex;gap:7px;flex-wrap:wrap}.chip{font-size:9px;font-weight:900;border:1px solid #17384d;border-radius:999px;padding:6px 9px;color:#607f92;background:#061019}.chip.on{color:#cffff0;border-color:#2b8258;background:#09231a}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#375264;margin-right:5px}.chip.on .dot{background:var(--green)}
 .accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctProxy{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+.proxyBadge{font-size:9px;font-weight:900;padding:3px 7px;border-radius:6px;margin-top:6px;border:1px solid #17384d;white-space:nowrap}
+.proxyBadge.idle{color:#7692a6;background:#061019}
+.proxyBadge.connected{color:#70f0ac;background:#09231a;border-color:#2b8258}
+.proxyBadge.error{color:#ff9aaa;background:#2a0f16;border-color:#74313d}
+.proxyBadge.testing{color:#ffd083;background:#231e09;border-color:#735b23}
 .rangeWrap{display:grid;grid-template-columns:1fr 56px;gap:8px;align-items:center}input[type=range]{padding:0}.pct{font-weight:900;text-align:center;border:1px solid #1a4058;border-radius:8px;padding:6px;background:#02080d}.toggle{display:flex;align-items:center;gap:7px;font-size:11px;color:#a5bdca}.toggle input{width:auto}
 .preview{width:100%;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:11px;margin-top:9px;border:1px solid #173044}.feed{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:9px;max-height:230px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.4}.reply{background:#02070b;border:1px solid #15364b;border-radius:9px;padding:11px;min-height:47px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}.stat{border:1px solid #15364b;background:#040c12;border-radius:9px;padding:9px}.stat b{display:block;font-size:17px}.stat span{font-size:8px;color:#668aa0}.activityTop{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:9px}
 @media(max-width:900px){.span6{grid-column:1/-1}.sectionGrid,.grid2,.grid4,.activityTop{grid-template-columns:1fr}.accounts{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}}
@@ -1113,23 +1144,29 @@ function renderAccounts(k){
   const list=k.accounts||[];
   $("accountLimit").textContent=list.length+" / "+(k.maxAccounts||10);
   $("addAccount").disabled=list.length>=(k.maxAccounts||10);
-  $("accounts").innerHTML=list.map(a=>
-    '<div class="acct '+(a.active?'active':'')+'">' +
+  $("accounts").innerHTML=list.map(a=>{
+    const statusClass = a.proxyStatus || 'idle';
+    const statusText = a.proxyStatus === 'connected' ? '🟢 Connected' : a.proxyStatus === 'error' ? '🔴 Error' : a.proxyStatus === 'testing' ? '🟡 Testing...' : '⚪ Idle';
+    const displayProxy = a.proxyUrl ? a.proxyUrl.replace(/^socks5:\/\//, '') : '';
+    return '<div class="acct '+(a.active?'active':'')+'">' +
       '<div class="acctTop">' +
         '<div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div>' +
         '<div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div>' +
       '</div>' +
       '<div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div>' +
-      '<input class="acctProxy" data-id="'+esc(a.id)+'" placeholder="socks5://user:pass@host:port" value="'+esc(a.proxyUrl||'')+'">' +
+      '<div style="display:flex;gap:6px;align-items:center">' +
+        '<input class="acctProxy" data-id="'+esc(a.id)+'" placeholder="69.55.49.177:38182" value="'+esc(displayProxy)+'" style="flex:1">' +
+        '<span class="proxyBadge '+statusClass+'">'+statusText+'</span>' +
+      '</div>' +
       '<div class="acctBtns">' +
         '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</a>' +
-        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save Proxy</button>' +
+        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save & Test</button>' +
         '<button class="small useAcct" data-id="'+esc(a.id)+'">Use</button>' +
         '<button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button>' +
         '<button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button>' +
       '</div>' +
-    '</div>'
-  ).join('')||'<div class="status">No account slots yet. Click + Add Account.</div>';
+    '</div>';
+  }).join('')||'<div class="status">No account slots yet. Click + Add Account.</div>';
 }
 function bindAccountButtons(){
   $("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});
