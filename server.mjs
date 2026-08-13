@@ -22,8 +22,6 @@ const OPENAI_REALTIME_TRANSCRIBE_MODEL = String(process.env.OPENAI_REALTIME_TRAN
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || "");
 const ANTHROPIC_BRAIN_MODEL = String(process.env.ANTHROPIC_BRAIN_MODEL || "claude-sonnet-5");
 
-// Cost estimates use current first-party API list prices and actual token usage returned by the APIs.
-// They are a dashboard guardrail, not an invoice. Override with env vars if provider pricing changes.
 const SONNET5_INPUT_USD_PER_M = Number(process.env.SONNET5_INPUT_USD_PER_M || 2);
 const SONNET5_OUTPUT_USD_PER_M = Number(process.env.SONNET5_OUTPUT_USD_PER_M || 10);
 const TRANSCRIBE_USD_PER_MIN = Number(process.env.TRANSCRIBE_USD_PER_MIN || 0.006);
@@ -35,7 +33,6 @@ const SESSION_SECRET = String(process.env.SESSION_SECRET || "");
 const DASHBOARD_PASSWORD = String(process.env.DASHBOARD_PASSWORD || "");
 const MAX_ACCOUNTS = 10;
 
-// ─── Anti-Detection / Fingerprint Spoofing ───
 const ENABLE_FINGERPRINT_SPOOFING = String(process.env.ENABLE_FINGERPRINT_SPOOFING || "true").toLowerCase() !== "false";
 const ENABLE_HUMAN_DELAY = String(process.env.ENABLE_HUMAN_DELAY || "true").toLowerCase() !== "false";
 const ANON_FINGERPRINT = ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("kick-api-anonymous") : null;
@@ -231,7 +228,7 @@ function saveState() {
     ...account,
     tokenEncrypted: seal(account.token),
     token: undefined,
-    browserProfile: undefined, // regenerable from account.id
+    browserProfile: undefined,
   }));
   fs.writeFileSync(STATE_FILE, JSON.stringify(snapshot, null, 2));
 }
@@ -251,6 +248,7 @@ let latestFrames = [];
 let latestContextAt = 0;
 let lastReply = "";
 let lastReplyAt = 0;
+let accountLastReplyAt = {};
 let lastBrain = null;
 let streamSession = { isLive: false, startedAt: "", sessionId: "", title: "", category: "", uptimeSeconds: 0 };
 let chatSubscription = { active: false, id: "", broadcasterUserId: "", error: "" };
@@ -499,55 +497,6 @@ async function queryStreamSession() {
   streamSession = next;
   return next;
 }
-async function postKickChat(content, replyToMessageId = "") {
-  const account = activeAccount();
-  if (!account) throw new Error("Select an active co-host account first.");
-
-  // Structural cleanup first
-  const clean = formatOutgoing(content);
-  // Then humanize the formatting (casual lowercase, trailing period removal, etc.)
-  const text = ENABLE_FINGERPRINT_SPOOFING ? humanizeChatFormatting(clean) : clean;
-
-  if (!text) throw new Error("No message to send.");
-
-  // Human typing delay before sending (reads like a real person typed it)
-  if (ENABLE_HUMAN_DELAY && account.browserProfile) {
-    const delay = calculateHumanTypingDelay(text, account.browserProfile);
-    await sleep(delay);
-  }
-
-  const token = await refreshKickToken(account.id);
-  if (!state.kick.broadcasterId) throw new Error("Resolve the streamer channel first.");
-  const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
-  if (replyToMessageId) payload.reply_to_message_id = String(replyToMessageId);
-
-  // Use account-specific fingerprint and individual account proxy for the chat send
-  const chatUrl = "https://api.kick.com/public/v1/chat";
-  const chatOpts = {
-    method: "POST",
-    headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload),
-  };
-
-  let data;
-  if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
-    const r = await impersonatedFetch(account, chatUrl, chatOpts, { 
-      profile: account.browserProfile,
-      proxyUrl: account.proxyUrl || "" 
-    });
-    data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
-  } else {
-    data = await kickJson(chatUrl, chatOpts);
-  }
-
-  lastReply = text;
-  lastReplyAt = Date.now();
-  state.metrics.sent++;
-  saveState();
-  log("Kick sent as @" + (account.username || account.label) + ":", text);
-  return data;
-}
 
 const KICK_PUBLIC_KEY_FALLBACK = `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq/+l1WnlRrGSolDMA+A8
@@ -680,6 +629,8 @@ async function callOpenAIBrain(ctx) {
 }
 async function runBrain(ctx) {
   const beforeCost = costStatus();
+  const connected = connectedAccounts();
+
   if (beforeCost.throttle === "paused") {
     const threshold = Number(state.settings.humanReactionPercent || 0);
     lastBrain = { provider: state.settings.provider, score: 0, threshold, shouldReply: false, reason: "stream budget guard reached; auto brain paused", reply: "" };
@@ -687,35 +638,109 @@ async function runBrain(ctx) {
     log("Budget guard:", "$" + beforeCost.totalUsd.toFixed(2) + " / $" + beforeCost.budget.toFixed(2) + " • auto brain paused");
     return { action: "skip", ...lastBrain, cost: beforeCost };
   }
-  state.metrics.brainCalls++;
-  const provider = state.settings.provider;
-  const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
-  const result = called?.result;
-  recordBrainUsage(provider, called?.usage || {});
-  if (!result || typeof result !== "object") throw new Error(provider + " returned invalid JSON.");
-  const score = Math.round(clamp(result.reaction_score, 0, 100));
-  const reply = formatOutgoing(result.reply || "");
-  const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
-  const threshold = Number(state.settings.humanReactionPercent || 0);
-  const allowedByScore = score >= threshold || directlyAddressed;
-  const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
-  lastBrain = { provider, score, threshold, shouldReply, reason: cleanText(result.reason, 160), reply };
+
+  if (!connected.length) {
+    state.metrics.brainCalls++;
+    const provider = state.settings.provider;
+    const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
+    const result = called?.result;
+    recordBrainUsage(provider, called?.usage || {});
+    if (!result || typeof result !== "object") throw new Error(provider + " returned invalid JSON.");
+    const score = Math.round(clamp(result.reaction_score, 0, 100));
+    const reply = formatOutgoing(result.reply || "");
+    const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
+    const threshold = Number(state.settings.humanReactionPercent || 0);
+    const allowedByScore = score >= threshold || directlyAddressed;
+    const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
+    lastBrain = { provider, score, threshold, shouldReply, reason: cleanText(result.reason, 160), reply };
+    latestContextAt = Date.now();
+    if (!shouldReply) { state.metrics.skipped++; saveState(); return { action: "skip", ...lastBrain }; }
+    if (Date.now() - lastReplyAt < MIN_REPLY_INTERVAL_MS && !directlyAddressed) { state.metrics.skipped++; saveState(); return { action: "skip", ...lastBrain, reason: "reply cooldown" }; }
+    if (!state.settings.autoSend) return { action: "preview", ...lastBrain };
+    const token = await refreshKickToken();
+    const text = ENABLE_FINGERPRINT_SPOOFING ? humanizeChatFormatting(reply) : reply;
+    const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
+    if (ctx.viewerMessage?.messageId) payload.reply_to_message_id = String(ctx.viewerMessage.messageId);
+    const chatUrl = "https://api.kick.com/public/v1/chat";
+    const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
+    const r = await kickJson(chatUrl, chatOpts);
+    lastReply = text; lastReplyAt = Date.now(); state.metrics.sent++; saveState();
+    log("Kick sent:", text);
+    return { action: "sent", ...lastBrain };
+  }
+
+  // ─── Multi-account: each connected account independently brains ───
+  let anySent = false;
+  let lastResult = null;
+
+  for (const account of connected) {
+    try {
+      const accountCooldown = accountLastReplyAt[account.id] || 0;
+      if (Date.now() - accountCooldown < MIN_REPLY_INTERVAL_MS) {
+        log("@" + (account.username || account.label) + " on cooldown, skipping");
+        continue;
+      }
+
+      state.metrics.brainCalls++;
+      const provider = state.settings.provider;
+      const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
+      const result = called?.result;
+      recordBrainUsage(provider, called?.usage || {});
+
+      if (!result || typeof result !== "object") {
+        log("@" + (account.username || account.label) + " brain error: invalid JSON");
+        continue;
+      }
+
+      const score = Math.round(clamp(result.reaction_score, 0, 100));
+      let reply = formatOutgoing(result.reply || "");
+      if (ENABLE_FINGERPRINT_SPOOFING) reply = humanizeChatFormatting(reply);
+      const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
+      const threshold = Number(state.settings.humanReactionPercent || 0);
+      const allowedByScore = score >= threshold || directlyAddressed;
+      const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
+
+      if (!shouldReply || !state.settings.autoSend) {
+        log("@" + (account.username || account.label) + " quiet:", score + "% at threshold " + threshold + "%");
+        continue;
+      }
+
+      if (ENABLE_HUMAN_DELAY && account.browserProfile) {
+        await sleep(calculateHumanTypingDelay(reply, account.browserProfile));
+      }
+
+      const token = await refreshKickToken(account.id);
+      if (!state.kick.broadcasterId) throw new Error("Resolve the streamer channel first.");
+      const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: reply, type: "user" };
+      if (ctx.viewerMessage?.messageId) payload.reply_to_message_id = String(ctx.viewerMessage.messageId);
+
+      const chatUrl = "https://api.kick.com/public/v1/chat";
+      const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
+
+      let data;
+      if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
+        const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile, proxyUrl: account.proxyUrl || "" });
+        data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error("Kick API " + r.status + ": " + JSON.stringify(data));
+      } else {
+        data = await kickJson(chatUrl, chatOpts);
+      }
+
+      accountLastReplyAt[account.id] = Date.now();
+      lastReply = reply;
+      lastReplyAt = Date.now();
+      state.metrics.sent++;
+      lastResult = data;
+      anySent = true;
+      lastBrain = { provider, score, threshold, shouldReply: true, reason: cleanText(result.reason, 160), reply };
+      log("@" + (account.username || account.label) + " sent:", reply);
+    } catch (e) {
+      log("@" + (account.username || account.label) + " error:", e.message || e);
+    }
+  }
   latestContextAt = Date.now();
   saveState();
-  if (!shouldReply) {
-    state.metrics.skipped++;
-    saveState();
-    log("Brain quiet:", score + "% at threshold " + threshold + "% • " + lastBrain.reason);
-    return { action: "skip", ...lastBrain };
-  }
-  if (Date.now() - lastReplyAt < MIN_REPLY_INTERVAL_MS && !directlyAddressed) {
-    state.metrics.skipped++;
-    saveState();
-    return { action: "skip", ...lastBrain, reason: "reply cooldown" };
-  }
-  if (!state.settings.autoSend) return { action: "preview", ...lastBrain };
-  await postKickChat(reply, ctx.viewerMessage?.messageId || "");
-  return { action: "sent", ...lastBrain };
+  return { action: anySent ? "sent" : "skip", ...(lastBrain || { provider: state.settings.provider, score: 0, threshold: 0, shouldReply: false, reason: "no accounts replied", reply: "" }) };
 }
 
 app.post("/webhooks/kick", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
@@ -813,7 +838,6 @@ app.post("/logout", (req, res) => {
   res.redirect("/login");
 });
 
-// Keep provider webhooks, health checks, and the OAuth callback reachable without dashboard login.
 app.use((req, res, next) => {
   if (req.path === "/health" || req.path === "/auth/kick/callback") return next();
   return requireDashboardAuth(req, res, next);
@@ -853,29 +877,17 @@ app.post("/api/accounts/:id/disconnect", (req, res) => {
 app.post("/api/accounts/:id/proxy", async (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
-  
   let raw = String(req.body?.proxyUrl || "").trim();
-  if (raw && !raw.includes("://")) {
-    raw = "socks5://" + raw;
-  }
+  if (raw && !raw.includes("://")) raw = "socks5://" + raw;
   account.proxyUrl = raw;
-
   if (raw) {
     try {
       account.proxyStatus = "testing";
       saveState();
-      const testRes = await impersonatedFetch(account, "https://api.ipify.org?format=json", { method: "GET" }, {
-        profile: account.browserProfile,
-        proxyUrl: account.proxyUrl
-      });
+      const testRes = await impersonatedFetch(account, "https://api.ipify.org?format=json", { method: "GET" }, { profile: account.browserProfile, proxyUrl: account.proxyUrl });
       account.proxyStatus = testRes.ok ? "connected" : "error";
-    } catch {
-      account.proxyStatus = "error";
-    }
-  } else {
-    account.proxyStatus = "idle";
-  }
-
+    } catch { account.proxyStatus = "error"; }
+  } else { account.proxyStatus = "idle"; }
   saveState();
   log("Proxy status for @" + (account.username || account.label) + ": " + account.proxyStatus);
   res.json({ ok: true, proxyStatus: account.proxyStatus });
@@ -892,7 +904,7 @@ app.delete("/api/accounts/:id", (req, res) => {
 app.get("/auth/kick/start", (req, res) => {
   try {
     if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !KICK_REDIRECT_URI) throw new Error("Missing Kick OAuth environment variables.");
-    const accountId = String(req.query.accountId || "").trim(); // strict account slot routing
+    const accountId = String(req.query.accountId || "").trim();
     const account = state.kick.accounts.find(a => a.id === accountId);
     if (!account) throw new Error("Add an account slot first.");
     const verifier = crypto.randomBytes(48).toString("base64url");
@@ -900,15 +912,7 @@ app.get("/auth/kick/start", (req, res) => {
     const oauthState = crypto.randomBytes(24).toString("base64url");
     oauthPending.set(oauthState, { verifier, accountId, createdAt: Date.now() });
     for (const [key, value] of oauthPending) if (Date.now() - value.createdAt > 10 * 60 * 1000) oauthPending.delete(key);
-    const qs = new URLSearchParams({
-      response_type: "code",
-      client_id: KICK_CLIENT_ID,
-      redirect_uri: KICK_REDIRECT_URI,
-      scope: "user:read channel:read chat:write",
-      state: oauthState,
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-    });
+    const qs = new URLSearchParams({ response_type: "code", client_id: KICK_CLIENT_ID, redirect_uri: KICK_REDIRECT_URI, scope: "user:read channel:read chat:write", state: oauthState, code_challenge: challenge, code_challenge_method: "S256" });
     res.redirect("https://id.kick.com/oauth/authorize?" + qs.toString());
   } catch (e) {
     res.status(500).send("Kick authorization error: " + cleanText(e.message || e, 500));
@@ -922,14 +926,7 @@ app.get("/auth/kick/callback", async (req, res) => {
     if (!pending) throw new Error("OAuth state expired or invalid.");
     const account = state.kick.accounts.find(a => a.id === pending.accountId);
     if (!account) throw new Error("Account slot no longer exists.");
-    const body = new URLSearchParams({
-      grant_type: "authorization_code",
-      code: String(req.query.code || ""),
-      client_id: KICK_CLIENT_ID,
-      client_secret: KICK_CLIENT_SECRET,
-      redirect_uri: KICK_REDIRECT_URI,
-      code_verifier: pending.verifier,
-    });
+    const body = new URLSearchParams({ grant_type: "authorization_code", code: String(req.query.code || ""), client_id: KICK_CLIENT_ID, client_secret: KICK_CLIENT_SECRET, redirect_uri: KICK_REDIRECT_URI, code_verifier: pending.verifier });
     const token = await kickJson("https://id.kick.com/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
     const identity = await identifyKickUser(token.access_token);
     account.token = { ...token, expires_at: token.expires_in ? Date.now() + Number(token.expires_in) * 1000 : 0 };
@@ -984,7 +981,22 @@ app.post("/api/context/reset", (_req, res) => {
 });
 app.post("/api/manual-send", async (req, res) => {
   try {
-    await postKickChat(req.body?.content || "");
+    const account = activeAccount();
+    if (!account) throw new Error("Select an active co-host account first.");
+    let text = formatOutgoing(req.body?.content || "");
+    if (ENABLE_FINGERPRINT_SPOOFING) text = humanizeChatFormatting(text);
+    if (!text) throw new Error("No message to send.");
+    if (ENABLE_HUMAN_DELAY && account.browserProfile) await sleep(calculateHumanTypingDelay(text, account.browserProfile));
+    const token = await refreshKickToken(account.id);
+    const payload = { broadcaster_user_id: Number(state.kick.broadcasterId), content: text, type: "user" };
+    const chatUrl = "https://api.kick.com/public/v1/chat";
+    const chatOpts = { method: "POST", headers: { Authorization: "Bearer " + token.access_token, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) };
+    if (ENABLE_FINGERPRINT_SPOOFING && account.browserProfile) {
+      const r = await impersonatedFetch(account, chatUrl, chatOpts, { profile: account.browserProfile, proxyUrl: account.proxyUrl || "" });
+      await r.json();
+    } else { await kickJson(chatUrl, chatOpts); }
+    lastReply = text; lastReplyAt = Date.now(); state.metrics.sent++; saveState();
+    log("Manual sent:", text);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message || String(e) }); }
 });
@@ -1010,31 +1022,8 @@ app.post("/api/brain", async (req, res) => {
 app.post("/api/realtime-token", async (_req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured.");
-    const sessionConfig = {
-      session: {
-        type: "transcription",
-        audio: {
-          input: {
-            transcription: {
-              model: OPENAI_REALTIME_TRANSCRIBE_MODEL,
-              prompt: "Gaming livestream audio. Accurately transcribe casual speech, game terms, names, slang, and short reactions.",
-              language: "en",
-            },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.48,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 650,
-            },
-          },
-        },
-      },
-    };
-    const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: { Authorization: "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify(sessionConfig),
-    });
+    const sessionConfig = { session: { type: "transcription", audio: { input: { transcription: { model: OPENAI_REALTIME_TRANSCRIBE_MODEL, prompt: "Gaming livestream audio. Accurately transcribe casual speech, game terms, names, slang, and short reactions.", language: "en" }, turn_detection: { type: "server_vad", threshold: 0.48, prefix_padding_ms: 300, silence_duration_ms: 650 } } } } };
+    const r = await fetch("https://api.openai.com/v1/realtime/client_secrets", { method: "POST", headers: { Authorization: "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(sessionConfig) });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error("Realtime token error (" + r.status + "): " + JSON.stringify(data));
     res.json(data);
@@ -1077,7 +1066,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
   <div class="sectionGrid">
     <div>
       <div class="row"><div class="big">Co-host Accounts</div><button id="addAccount" class="small primary">+ Add Account</button><span id="accountLimit" class="status"></span></div>
-      <div class="status">You can connect up to 10 accounts. One account is selected as the active sender at a time.</div>
+      <div class="status">You can connect up to 10 accounts. Each account has its own independent AI brain. Use incognito/private browsing for each account's Connect.</div>
       <div id="accounts" class="accounts"></div>
     </div>
     <div>
@@ -1159,7 +1148,7 @@ function renderAccounts(k){
         '<span class="proxyBadge '+statusClass+'">'+statusText+'</span>' +
       '</div>' +
       '<div class="acctBtns">' +
-        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</a>' +
+        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'" target="_blank" rel="noopener noreferrer" title="Opens in new tab — use private/incognito for each account">'+(a.connected?'Reconnect':'Connect')+'</a>' +
         '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save & Test</button>' +
         '<button class="small useAcct" data-id="'+esc(a.id)+'">Use</button>' +
         '<button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button>' +
@@ -1209,7 +1198,7 @@ loadStatus();setInterval(loadStatus,3000);setInterval(()=>on('chipVision',runnin
 app.get("/", (_req, res) => res.type("html").send(DASHBOARD_HTML));
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log("AI Co-host rework 2.2 auth + ordered realtime transcript pipeline running on port " + PORT);
+  console.log("AI Co-host — each account has its own independent brain on port " + PORT);
   console.log("Brain providers: Sonnet 5=" + (ANTHROPIC_API_KEY ? "configured" : "missing key") + " • OpenAI=" + (OPENAI_API_KEY ? "configured" : "missing key"));
 });
 
