@@ -26,7 +26,7 @@ const SONNET5_INPUT_USD_PER_M = Number(process.env.SONNET5_INPUT_USD_PER_M || 2)
 const SONNET5_OUTPUT_USD_PER_M = Number(process.env.SONNET5_OUTPUT_USD_PER_M || 10);
 const TRANSCRIBE_USD_PER_MIN = Number(process.env.TRANSCRIBE_USD_PER_MIN || 0.006);
 
-const BOT_PERSONA = String(process.env.BOT_PERSONA || "casual gaming friend; short reactions; helpful when asked; no forced hype; no long paragraphs");
+const DEFAULT_PERSONA = String(process.env.BOT_PERSONA || "casual gaming friend; short reactions; helpful when asked; no forced hype; no long paragraphs");
 const AUTO_SEND_ENV = String(process.env.AUTO_SEND || "true").toLowerCase() === "true";
 const MIN_REPLY_INTERVAL_MS = Math.max(3000, Number(process.env.MIN_REPLY_INTERVAL_MS || 12000));
 const SESSION_SECRET = String(process.env.SESSION_SECRET || "");
@@ -111,7 +111,7 @@ const defaultState = () => ({
     humanReactionPercent: Math.max(0, Math.min(100, Number(process.env.DEFAULT_HUMAN_REACTION_PERCENT || 10))),
     autoSend: AUTO_SEND_ENV,
     viewerReplies: false,
-    persona: BOT_PERSONA,
+    persona: DEFAULT_PERSONA,
     captureFps: 60,
     visionFps: 6,
     visionWidth: 1280,
@@ -165,6 +165,8 @@ function newAccount(label = "") {
     username: "",
     proxyUrl: "",
     proxyStatus: "idle",
+    enabled: true, // Selected/deselected for chatting
+    persona: DEFAULT_PERSONA, // Individual brain persona
     browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(id) : null,
     createdAt: Date.now(),
   };
@@ -188,6 +190,8 @@ function loadState() {
           username: String(item.username || ""),
           proxyUrl: String(item.proxyUrl || ""),
           proxyStatus: String(item.proxyStatus || "idle"),
+          enabled: item.enabled !== undefined ? Boolean(item.enabled) : true,
+          persona: String(item.persona || DEFAULT_PERSONA),
           browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile(item.id || "anon") : null,
           createdAt: Number(item.createdAt || Date.now()),
         });
@@ -201,6 +205,8 @@ function loadState() {
         username: String(rawKick.username || ""),
         proxyUrl: "",
         proxyStatus: "idle",
+        enabled: true,
+        persona: DEFAULT_PERSONA,
         browserProfile: ENABLE_FINGERPRINT_SPOOFING ? buildBrowserProfile("legacy-account-1") : null,
         createdAt: Date.now(),
       });
@@ -352,7 +358,7 @@ function activeAccount() {
   return state.kick.accounts.find(a => a.id === state.kick.activeAccountId) || null;
 }
 function connectedAccounts() {
-  return state.kick.accounts.filter(a => Boolean(a.token?.access_token));
+  return state.kick.accounts.filter(a => Boolean(a.token?.access_token) && a.enabled !== false);
 }
 function clearContext(reason) {
   transcripts = [];
@@ -387,6 +393,8 @@ function publicStatus() {
         userId: a.userId,
         proxyUrl: a.proxyUrl || "",
         proxyStatus: a.proxyStatus || "idle",
+        enabled: a.enabled !== false,
+        persona: a.persona || DEFAULT_PERSONA,
         active: a.id === state.kick.activeAccountId,
       })),
       broadcasterId: state.kick.broadcasterId,
@@ -563,10 +571,10 @@ function safeJSON(text) {
   if (match) { try { return JSON.parse(match[0]); } catch {} }
   return null;
 }
-function brainPrompt({ transcript, eventType = "streamer_speech", viewerMessage = null }) {
+function brainPrompt(persona, { transcript, eventType = "streamer_speech", viewerMessage = null }) {
   return [
     "You are the decision-and-reply brain for a disclosed AI co-host in a gaming livestream.",
-    "Persona: " + state.settings.persona,
+    "Persona: " + persona,
     "Keep chat replies short, casual, specific to what is happening, usually 2-14 words. Avoid polished assistant language.",
     "Do not invent game events, facts, or what you can see. Use only the supplied context and attached recent frames.",
     "The attached frames, when present, are chronological recent snapshots ending with the newest frame.",
@@ -584,9 +592,9 @@ function brainPrompt({ transcript, eventType = "streamer_speech", viewerMessage 
     "stream category/game: " + (streamSession.category || "(unknown)"),
   ].join("\n");
 }
-async function callAnthropicBrain(ctx) {
+async function callAnthropicBrain(persona, ctx) {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured.");
-  const content = [{ type: "text", text: brainPrompt(ctx) }];
+  const content = [{ type: "text", text: brainPrompt(persona, ctx) }];
   const burst = effectiveVisionBurst();
   for (const frame of (burst > 0 ? latestFrames.slice(-burst) : [])) {
     const image = extractBase64Image(frame.dataUrl);
@@ -612,9 +620,9 @@ async function callAnthropicBrain(ctx) {
   const text = (Array.isArray(data?.content) ? data.content : []).filter(x => x.type === "text").map(x => x.text).join("\n");
   return { result: safeJSON(text), usage: data?.usage || {} };
 }
-async function callOpenAIBrain(ctx) {
+async function callOpenAIBrain(persona, ctx) {
   if (!openai) throw new Error("OPENAI_API_KEY is not configured.");
-  const content = [{ type: "input_text", text: brainPrompt(ctx) }];
+  const content = [{ type: "input_text", text: brainPrompt(persona, ctx) }];
   const burst = effectiveVisionBurst();
   for (const frame of (burst > 0 ? latestFrames.slice(-burst) : [])) {
     if (extractBase64Image(frame.dataUrl)) content.push({ type: "input_image", image_url: frame.dataUrl, detail: "low" });
@@ -642,12 +650,12 @@ async function runBrain(ctx) {
   if (!connected.length) {
     state.metrics.brainCalls++;
     const provider = state.settings.provider;
-    const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
+    const called = provider === "openai" ? await callOpenAIBrain(state.settings.persona, ctx) : await callAnthropicBrain(state.settings.persona, ctx);
     const result = called?.result;
     recordBrainUsage(provider, called?.usage || {});
     if (!result || typeof result !== "object") throw new Error(provider + " returned invalid JSON.");
     const score = Math.round(clamp(result.reaction_score, 0, 100));
-    const reply = formatOutgoing(result.reply || "");
+    let reply = formatOutgoing(result.reply || "");
     const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
     const threshold = Number(state.settings.humanReactionPercent || 0);
     const allowedByScore = score >= threshold || directlyAddressed;
@@ -669,41 +677,40 @@ async function runBrain(ctx) {
     return { action: "sent", ...lastBrain };
   }
 
-  // ─── Multi-account: each connected account independently brains ───
+  // ─── Multi-account: each enabled account independently brains ───
   let anySent = false;
   let lastResult = null;
 
   for (const account of connected) {
     try {
       const accountCooldown = accountLastReplyAt[account.id] || 0;
-      if (Date.now() - accountCooldown < MIN_REPLY_INTERVAL_MS) {
-        log("@" + (account.username || account.label) + " on cooldown, skipping");
-        continue;
-      }
+      if (Date.now() - accountCooldown < MIN_REPLY_INTERVAL_MS) continue;
 
       state.metrics.brainCalls++;
       const provider = state.settings.provider;
-      const called = provider === "openai" ? await callOpenAIBrain(ctx) : await callAnthropicBrain(ctx);
+      const accountPersona = account.persona || state.settings.persona;
+      const called = provider === "openai" ? await callOpenAIBrain(accountPersona, ctx) : await callAnthropicBrain(accountPersona, ctx);
       const result = called?.result;
       recordBrainUsage(provider, called?.usage || {});
 
-      if (!result || typeof result !== "object") {
-        log("@" + (account.username || account.label) + " brain error: invalid JSON");
-        continue;
-      }
+      if (!result || typeof result !== "object") continue;
 
       const score = Math.round(clamp(result.reaction_score, 0, 100));
       let reply = formatOutgoing(result.reply || "");
       if (ENABLE_FINGERPRINT_SPOOFING) reply = humanizeChatFormatting(reply);
+
+      // Prevent duplicate text across accounts
+      if (reply.toLowerCase() === lastReply.toLowerCase()) {
+        reply = formatOutgoing("yeah, " + reply);
+        if (ENABLE_FINGERPRINT_SPOOFING) reply = humanizeChatFormatting(reply);
+      }
+
       const directlyAddressed = /\b(ai|cohost|co-host|chatbot|bot)\b/i.test(ctx.transcript || "") || /\?\s*$/.test(ctx.transcript || "");
       const threshold = Number(state.settings.humanReactionPercent || 0);
       const allowedByScore = score >= threshold || directlyAddressed;
       const shouldReply = Boolean(result.should_reply) && allowedByScore && Boolean(reply);
 
-      if (!shouldReply || !state.settings.autoSend) {
-        log("@" + (account.username || account.label) + " quiet:", score + "% at threshold " + threshold + "%");
-        continue;
-      }
+      if (!shouldReply || !state.settings.autoSend) continue;
 
       if (ENABLE_HUMAN_DELAY && account.browserProfile) {
         await sleep(calculateHumanTypingDelay(reply, account.browserProfile));
@@ -865,6 +872,21 @@ app.post("/api/accounts/:id/active", (req, res) => {
   log("Active sender:", account.username ? "@" + account.username : account.label);
   res.json({ ok: true });
 });
+app.post("/api/accounts/:id/toggle", (req, res) => {
+  const account = state.kick.accounts.find(a => a.id === req.params.id);
+  if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
+  account.enabled = req.body?.enabled !== undefined ? Boolean(req.body.enabled) : !account.enabled;
+  saveState();
+  log("Account @" + (account.username || account.label) + " enabled: " + account.enabled);
+  res.json({ ok: true, enabled: account.enabled });
+});
+app.post("/api/accounts/:id/persona", (req, res) => {
+  const account = state.kick.accounts.find(a => a.id === req.params.id);
+  if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
+  account.persona = cleanText(req.body?.persona, 600) || DEFAULT_PERSONA;
+  saveState();
+  res.json({ ok: true });
+});
 app.post("/api/accounts/:id/disconnect", (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
@@ -958,7 +980,7 @@ app.post("/api/settings", (req, res) => {
   if (body.humanReactionPercent !== undefined) state.settings.humanReactionPercent = Math.round(clamp(body.humanReactionPercent, 0, 100));
   if (body.autoSend !== undefined) state.settings.autoSend = Boolean(body.autoSend);
   if (body.viewerReplies !== undefined) state.settings.viewerReplies = Boolean(body.viewerReplies);
-  if (body.persona !== undefined) state.settings.persona = cleanText(body.persona, 600) || BOT_PERSONA;
+  if (body.persona !== undefined) state.settings.persona = cleanText(body.persona, 600) || DEFAULT_PERSONA;
   if (body.captureFps !== undefined) state.settings.captureFps = [30, 60].includes(Number(body.captureFps)) ? Number(body.captureFps) : 60;
   if (body.visionFps !== undefined) state.settings.visionFps = clamp(body.visionFps, 1, 8);
   if (body.visionWidth !== undefined) state.settings.visionWidth = [720, 960, 1280, 1600].includes(Number(body.visionWidth)) ? Number(body.visionWidth) : 1280;
@@ -1044,7 +1066,7 @@ header,.card{background:linear-gradient(180deg,#0b1824,#07111a);border:1px solid
 input,select,textarea,button{font:inherit}input,select,textarea{width:100%;background:#03090e;border:1px solid #1a4058;color:#fff;border-radius:9px;padding:9px}textarea{min-height:72px;resize:vertical}button,.btn{border:1px solid #23516a;background:#0b2231;color:#effaff;padding:9px 12px;border-radius:9px;font-weight:800;cursor:pointer;text-decoration:none}.primary{background:#0b88b5;border-color:#1bb7ea}.danger{border-color:#74313d;color:#ffb2be}.small{padding:6px 9px;font-size:11px}.ghost{background:#06131d}
 .label{font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:#6e94aa;margin:8px 0 4px}.status{font-size:11px;color:#9ab3c3;min-height:17px;margin-top:6px;word-break:break-word}.big{font-size:19px;font-weight:900}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:#70f0ac}.warn{color:#ffd083}.bad{color:#ff9aaa}
 .chips{display:flex;gap:7px;flex-wrap:wrap}.chip{font-size:9px;font-weight:900;border:1px solid #17384d;border-radius:999px;padding:6px 9px;color:#607f92;background:#061019}.chip.on{color:#cffff0;border-color:#2b8258;background:#09231a}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#375264;margin-right:5px}.chip.on .dot{background:var(--green)}
-.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.active{border-color:#2f9866;background:#071a13}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctProxy{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+.accounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:9px}.acct{border:1px solid #15364b;background:#040d14;border-radius:10px;padding:9px}.acct.disabled{opacity:.5}.acctTop{display:flex;justify-content:space-between;gap:8px;align-items:center}.acctName{font-weight:900;font-size:12px}.acctMeta{font-size:10px;color:#7896a8;margin-top:3px}.acctProxy{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca}.acctPersona{width:100%;margin-top:6px;font-size:10px;padding:5px 7px;background:#02070b;border:1px solid #1a4058;border-radius:6px;color:#a5bdca;min-height:45px}.acctBtns{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
 .proxyBadge{font-size:9px;font-weight:900;padding:3px 7px;border-radius:6px;margin-top:6px;border:1px solid #17384d;white-space:nowrap}
 .proxyBadge.idle{color:#7692a6;background:#061019}
 .proxyBadge.connected{color:#70f0ac;background:#09231a;border-color:#2b8258}
@@ -1066,7 +1088,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
   <div class="sectionGrid">
     <div>
       <div class="row"><div class="big">Co-host Accounts</div><button id="addAccount" class="small primary">+ Add Account</button><span id="accountLimit" class="status"></span></div>
-      <div class="status">You can connect up to 10 accounts. Each account has its own independent AI brain. Use incognito/private browsing for each account's Connect.</div>
+      <div class="status">You can connect up to 10 accounts. Each has its own independent brain & persona. Select/deselect accounts to chat.</div>
       <div id="accounts" class="accounts"></div>
     </div>
     <div>
@@ -1088,7 +1110,7 @@ input,select,textarea,button{font:inherit}input,select,textarea{width:100%;backg
     <div><div class="label">Per-stream budget</div><div class="rangeWrap"><input id="streamBudget" type="range" min="5" max="50" step="1"><div id="streamBudgetPct" class="pct">$20</div></div></div>
     <div><div class="label">Estimated cost</div><div id="costMeter" class="pct">$0.00 / $20</div><div id="costState" class="status">Normal vision</div></div>
   </div>
-  <div class="label">Persona</div><textarea id="persona"></textarea>
+  <div class="label">Global Persona</div><textarea id="persona"></textarea>
   <div class="row"><label class="toggle"><input id="autoSend" type="checkbox"> Auto send</label><label class="toggle"><input id="viewerReplies" type="checkbox"> Viewer replies</label><button id="saveSettings" class="small primary">Save</button><button id="resetContext" class="small">Reset Context</button></div>
   <div id="brainSettingsState" class="status"></div>
 </section>
@@ -1137,37 +1159,44 @@ function renderAccounts(k){
     const statusClass = a.proxyStatus || 'idle';
     const statusText = a.proxyStatus === 'connected' ? '🟢 Connected' : a.proxyStatus === 'error' ? '🔴 Error' : a.proxyStatus === 'testing' ? '🟡 Testing...' : '⚪ Idle';
     const displayProxy = a.proxyUrl ? a.proxyUrl.replace(/^socks5:\/\//, '') : '';
-    return '<div class="acct '+(a.active?'active':'')+'">' +
+    const isEnabled = a.enabled !== false;
+    return '<div class="acct '+(isEnabled?'':'disabled')+'">' +
       '<div class="acctTop">' +
         '<div class="acctName">'+esc(a.connected?('@'+(a.username||a.label)):a.label)+'</div>' +
-        '<div class="'+(a.connected?'ok':'warn')+'">'+(a.active?'ACTIVE':(a.connected?'CONNECTED':'EMPTY'))+'</div>' +
+        '<div class="row" style="gap:4px">' +
+          '<button class="small '+(isEnabled?'primary':'ghost')+' toggleAcct" data-id="'+esc(a.id)+'">'+(isEnabled?'🟢 Active':'⚪ Off')+'</button>' +
+        '</div>' +
       '</div>' +
-      '<div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect this slot with official OAuth')+'</div>' +
+      '<div class="acctMeta">'+(a.connected?('user '+esc(a.userId||'?')):'Connect slot with OAuth')+'</div>' +
       '<div style="display:flex;gap:6px;align-items:center">' +
         '<input class="acctProxy" data-id="'+esc(a.id)+'" placeholder="69.55.49.177:38182" value="'+esc(displayProxy)+'" style="flex:1">' +
         '<span class="proxyBadge '+statusClass+'">'+statusText+'</span>' +
       '</div>' +
+      '<textarea class="acctPersona" data-id="'+esc(a.id)+'" placeholder="Account persona...">'+esc(a.persona||'')+'</textarea>' +
       '<div class="acctBtns">' +
-        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'" target="_blank" rel="noopener noreferrer" title="Opens in new tab — use private/incognito for each account">'+(a.connected?'Reconnect':'Connect')+'</a>' +
-        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save & Test</button>' +
-        '<button class="small useAcct" data-id="'+esc(a.id)+'">Use</button>' +
-        '<button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button>' +
+        '<a class="btn small primary" href="/auth/kick/start?accountId='+encodeURIComponent(a.id)+'" target="_blank" rel="noopener noreferrer" title="Opens in new tab">'+(a.connected?'Reconnect':'Connect')+'</a>' +
+        '<button class="small saveProxy" data-id="'+esc(a.id)+'">Save Proxy</button>' +
+        '<button class="small savePersona" data-id="'+esc(a.id)+'">Save Persona</button>' +
         '<button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button>' +
       '</div>' +
     '</div>';
   }).join('')||'<div class="status">No account slots yet. Click + Add Account.</div>';
 }
 function bindAccountButtons(){
-  $("accounts").querySelectorAll(".useAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/active",{method:"POST",body:"{}"});await loadStatus()});
-  $("accounts").querySelectorAll(".disconnectAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/disconnect",{method:"POST",body:"{}"});await loadStatus()});
+  $("accounts").querySelectorAll(".toggleAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/toggle",{method:"POST",body:"{}"});await loadStatus()});
   $("accounts").querySelectorAll(".deleteAcct").forEach(b=>b.onclick=async()=>{await jf("/api/accounts/"+encodeURIComponent(b.dataset.id),{method:"DELETE"});await loadStatus()});
   $("accounts").querySelectorAll(".saveProxy").forEach(b=>b.onclick=async()=>{
     const input = $("accounts").querySelector('input.acctProxy[data-id="'+b.dataset.id+'"]');
     await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/proxy",{method:"POST",body:JSON.stringify({proxyUrl:input?.value||""})});
     await loadStatus();
   });
+  $("accounts").querySelectorAll(".savePersona").forEach(b=>b.onclick=async()=>{
+    const area = $("accounts").querySelector('textarea.acctPersona[data-id="'+b.dataset.id+'"]');
+    await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/persona",{method:"POST",body:JSON.stringify({persona:area?.value||""})});
+    await loadStatus();
+  });
 }
-function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt)+' • active sender '+(k.activeUsername?('@'+k.activeUsername):'none');$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
+function render(d){const k=d.kick||{},rt=d.runtime||{},m=rt.metrics||{},ss=d.streamSession||{};renderAccounts(k);bindAccountButtons();if(!$('channelSlug').value)$('channelSlug').value=k.channelSlug||'';$('channelState').textContent=k.broadcasterId?'Broadcaster '+k.broadcasterId+' • webhook '+(k.subscription?.active?'active':'not active'):'Resolve the current streamer';$('liveState').textContent=ss.isLive?'LIVE':'OFFLINE / UNKNOWN';$('liveState').className='big '+(ss.isLive?'ok':'warn');$('streamMeta').textContent=ss.isLive?((ss.category||'Gaming')+' • '+(ss.title||'Untitled')+' • '+fmtUptime(ss.uptimeSeconds)):'No active live session reported';$('brainCalls').textContent=m.brainCalls||0;$('sentCount').textContent=m.sent||0;$('chatCount').textContent=m.chatEvents||0;$('ignoredChat').textContent=m.ignoredChatEvents||0;$('latestHeard').textContent=rt.lastHeard||'(nothing yet)';$('latestReply').textContent=rt.lastReply||'(none)';$('brainDecision').textContent=brainText(rt.lastBrain);$('contextState').textContent='Context '+ago(rt.latestContextAt)+' • vision '+ago(rt.latestFrameAt)+' • webhook '+ago(rt.lastWebhookAt);$('logFeed').textContent=(rt.logs||[]).join('\n')||'No logs yet';$('logFeed').scrollTop=$('logFeed').scrollHeight;$('chatFeed').textContent=(rt.recentChat||[]).map(x=>'['+new Date(x.createdAt||x.receivedAt).toLocaleTimeString()+'] '+x.username+': '+x.content).join('\n')||'Waiting for current-stream webhook events.';on('chipVision',running&&Date.now()-frameAt<2500);on('chipContext',Date.now()-(rt.latestContextAt||0)<60000);if(document.activeElement!==$('provider'))$('provider').value=d.settings.provider;if(document.activeElement!==$('reaction')){$('reaction').value=d.settings.humanReactionPercent;$('reactionPct').textContent=d.settings.humanReactionPercent+'%'}if(document.activeElement!==$('persona'))$('persona').value=d.settings.persona||'';$('autoSend').checked=!!d.settings.autoSend;$('viewerReplies').checked=!!d.settings.viewerReplies;$('captureFps').value=String(d.settings.captureFps||60);$('visionFps').value=String(d.settings.visionFps||6);$('visionWidth').value=String(d.settings.visionWidth||1280);$('visionBurstFrames').value=String(d.settings.visionBurstFrames||4);if(document.activeElement!==$('streamBudget')){$('streamBudget').value=String(d.settings.streamBudgetDollars||20);$('streamBudgetPct').textContent='$'+String(d.settings.streamBudgetDollars||20)}const c=rt.cost||{};$('costMeter').textContent='$'+Number(c.totalUsd||0).toFixed(2)+' / $'+Number(c.budget||d.settings.streamBudgetDollars||20).toFixed(0);$('costState').textContent=(c.throttle==='paused'?'Budget guard PAUSED auto brain':c.throttle==='heavy'?'Heavy vision throttle • 1 frame/call':c.throttle==='light'?'Light vision throttle • max 2 frames/call':'Normal vision')+' • brain $'+Number(c.brainUsd||0).toFixed(2)+' • hearing $'+Number(c.transcriptionUsd||0).toFixed(2);const ap=d.providers?.anthropic?.configured?'Sonnet 5 ready':'Sonnet 5 key missing';const op=d.providers?.openai?.configured?'OpenAI ready':'OpenAI key missing';$('brainSettingsState').textContent=ap+' • '+op}
 async function loadStatus(){try{render(await jf('/api/status'))}catch(e){$('logFeed').textContent='Status error: '+e.message}}
 $('addAccount').onclick=async()=>{try{const d=await jf('/api/accounts/add',{method:'POST',body:'{}'});location.href='/auth/kick/start?accountId='+encodeURIComponent(d.accountId)}catch(e){$('accountLimit').textContent=e.message}};
 $('reaction').oninput=()=>$('reactionPct').textContent=$('reaction').value+'%';
@@ -1198,10 +1227,10 @@ loadStatus();setInterval(loadStatus,3000);setInterval(()=>on('chipVision',runnin
 app.get("/", (_req, res) => res.type("html").send(DASHBOARD_HTML));
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log("AI Co-host — each account has its own independent brain on port " + PORT);
+  console.log("AI Co-host — per-account personas & active toggle running on port " + PORT);
   console.log("Brain providers: Sonnet 5=" + (ANTHROPIC_API_KEY ? "configured" : "missing key") + " • OpenAI=" + (OPENAI_API_KEY ? "configured" : "missing key"));
 });
 
 setInterval(() => queryStreamSession().catch(() => {}), 60000).unref();
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)));
+process.on("SIGINT", () => server.close(() => process.exit(0)))
