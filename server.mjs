@@ -71,18 +71,20 @@ const proxyDispatchers = new Map();
 function normalizeProxyUrl(value) {
   let raw = String(value || "").trim();
   if (!raw) return "";
+  // Dashboard uses the old simple host:port format. Internally we normalize it
+  // to an HTTP proxy URL for Undici without changing what the user types/sees.
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = "http://" + raw;
-  raw = raw.replace(/^socks5h:\/\//i, "socks5://");
   const u = new URL(raw);
-  if (!["http:", "https:", "socks:", "socks5:"].includes(u.protocol)) throw new Error("Proxy must use http://, https://, socks://, or socks5://");
-  if (!u.hostname || !u.port) throw new Error("Proxy must include host and port.");
-  return u.toString();
+  if (!["http:", "https:"].includes(u.protocol)) throw new Error("Proxy must be entered as host:port (example: 129.23.23.15:1855).");
+  if (!u.hostname || !u.port) throw new Error("Proxy must be entered as host:port (example: 129.23.23.15:1855).");
+  if (u.username || u.password) throw new Error("Use only host:port in the proxy field.");
+  return u.protocol + "//" + u.hostname + ":" + u.port;
 }
 function proxyDisplay(value) {
   if (!value) return "direct";
   try {
     const u = new URL(value);
-    return u.protocol + "//" + u.hostname + ":" + u.port;
+    return u.hostname + ":" + u.port;
   } catch { return "configured"; }
 }
 function getProxyDispatcher(proxyUrl) {
@@ -224,6 +226,7 @@ function newAccount(label = "") {
     token: null,
     userId: "",
     username: "",
+    kickLoginUsername: "",
     proxy: "",
     persona: "",
     ...normalizeAccountStyle(),
@@ -248,6 +251,7 @@ function loadState() {
           token: item.tokenEncrypted ? unseal(item.tokenEncrypted) : (item.token || null),
           userId: String(item.userId || ""),
           username: String(item.username || ""),
+          kickLoginUsername: String(item.kickLoginUsername || "").replace(/^@/, "").slice(0, 80),
           proxy: item.proxyEncrypted ? String(unseal(item.proxyEncrypted) || "") : String(item.proxy || ""),
           persona: String(item.persona || "").slice(0, 600),
           ...normalizeAccountStyle(item),
@@ -262,6 +266,7 @@ function loadState() {
         token: rawKick.tokenEncrypted ? unseal(rawKick.tokenEncrypted) : (rawKick.token || null),
         userId: String(rawKick.userId || ""),
         username: String(rawKick.username || ""),
+        kickLoginUsername: String(rawKick.username || "").replace(/^@/, "").slice(0, 80),
         proxy: "",
         persona: "",
         ...normalizeAccountStyle(),
@@ -584,6 +589,8 @@ function publicStatus() {
         label: a.label,
         connected: Boolean(a.token?.access_token),
         username: a.username,
+        kickLoginUsername: String(a.kickLoginUsername || ""),
+        kickLoginUsernameSaved: Boolean(String(a.kickLoginUsername || "").trim()),
         userId: a.userId,
         proxyConfigured: Boolean(a.proxy),
         proxyDisplay: proxyDisplay(a.proxy),
@@ -1139,6 +1146,7 @@ app.post("/api/accounts/:id/style", (req, res) => {
   const account = state.kick.accounts.find(a => a.id === req.params.id);
   if (!account) return res.status(404).json({ ok: false, error: "Account not found." });
   const body = req.body || {};
+  if (body.kickLoginUsername !== undefined) account.kickLoginUsername = cleanText(body.kickLoginUsername || "", 80).replace(/^@+/, "").trim();
   if (body.persona !== undefined) account.persona = cleanText(body.persona || "", 600);
   const style = normalizeAccountStyle({
     ...account,
@@ -1185,8 +1193,10 @@ function kickOAuthResultPage(ok, message, accountId = "") {
 function kickSwitchAccountPage(account) {
   const accountId = String(account?.id || "");
   const label = cleanText(account?.label || "this account slot", 80).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const savedUsername = cleanText(account?.kickLoginUsername || "", 80).replace(/^@+/, "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const targetHint = savedUsername ? `<br><br><b>Saved username for this slot:</b> @${savedUsername}` : "";
   const continueUrl = "/auth/kick/start?accountId=" + encodeURIComponent(accountId) + "&switched=1";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Switch Kick account</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:24px}.box{max-width:620px;margin:7vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:24px}h2{margin-top:0}.steps{line-height:1.65;color:#c9ddea}.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}a.btn{display:inline-block;padding:11px 15px;border-radius:9px;text-decoration:none;font-weight:800}.kick{background:#53fc18;color:#041006}.go{background:#1286b2;color:white}.note{font-size:12px;color:#86a3b8;margin-top:18px}</style></head><body><div class="box"><h2>Connect a different Kick account to ${label}</h2><div class="steps">Kick is currently reusing whichever Kick account is already signed in to this browser.<br><br><b>1.</b> Click <b>Open Kick</b> below.<br><b>2.</b> Log out of the currently signed-in Kick account.<br><b>3.</b> Log in to the different Kick account you want for ${label}.<br><b>4.</b> Come back to this window and click <b>Continue OAuth</b>.</div><div class="btns"><a class="btn kick" href="https://kick.com/" target="_blank" rel="noopener">Open Kick</a><a class="btn go" href="${continueUrl}">Continue OAuth</a></div><div class="note">A new account slot cannot create a separate Kick browser login session by itself. This step prevents accidentally reconnecting the same Kick account.</div></div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Switch Kick account</title><style>body{font-family:system-ui;background:#07111a;color:#edf8ff;padding:24px}.box{max-width:620px;margin:7vh auto;background:#0b1824;border:1px solid #173044;border-radius:14px;padding:24px}h2{margin-top:0}.steps{line-height:1.65;color:#c9ddea}.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}a.btn{display:inline-block;padding:11px 15px;border-radius:9px;text-decoration:none;font-weight:800}.kick{background:#53fc18;color:#041006}.go{background:#1286b2;color:white}.note{font-size:12px;color:#86a3b8;margin-top:18px}</style></head><body><div class="box"><h2>Connect a different Kick account to ${label}</h2><div class="steps">Kick is currently reusing whichever Kick account is already signed in to this browser.${targetHint}<br><br><b>1.</b> Click <b>Open Kick</b> below.<br><b>2.</b> Log out of the currently signed-in Kick account.<br><b>3.</b> Log in to the Kick account saved for ${label} (or the account you want in this slot).<br><b>4.</b> Come back to this window and click <b>Continue OAuth</b>.</div><div class="btns"><a class="btn kick" href="https://kick.com/" target="_blank" rel="noopener">Open Kick</a><a class="btn go" href="${continueUrl}">Continue OAuth</a></div><div class="note">The saved username is only a label/reminder for this slot. Your Kick password stays on Kick's login page and is not stored by this app.</div></div></body></html>`;
 }
 
 app.get("/auth/kick/start", (req, res) => {
@@ -1461,8 +1471,11 @@ function renderAccounts(k){
         '<span class="miniFlag '+(a.tokenValid?'ok':'warn')+'">'+(a.tokenValid?'Token valid':'Token unavailable')+'</span>'+
         '<span class="miniFlag '+(a.proxyConfigured?'ok':'warn')+'">'+(a.proxyConfigured?'Proxy set':'Direct')+'</span>'+
         '<span class="miniFlag '+(a.personaSaved?'ok':'warn')+'">'+(a.personaSaved?'Persona saved':'Global persona')+'</span>'+
+        '<span class="miniFlag '+(a.kickLoginUsernameSaved?'ok':'warn')+'">'+(a.kickLoginUsernameSaved?'Kick username saved':'No saved Kick username')+'</span>'+
       '</div>'+
       '<div class="acctMeta">Last message: '+ago(a.lastMessageAt)+' • this stream: '+Number(a.messagesThisStream||0)+' • cooldown: '+(cooldownLeft>0?(cooldownLeft+'s left'):'ready')+'</div>'+
+      '<div class="label">Saved Kick username</div><input class="kickLoginUsernameInput" data-id="'+esc(a.id)+'" placeholder="Kick username for this account slot" value="'+esc(a.kickLoginUsername||'')+'">'+
+      '<div class="acctMeta">Username only. Password is entered on Kick when you connect.</div>'+
       '<div class="label">Account persona</div><textarea class="accountPersonaInput" data-id="'+esc(a.id)+'" placeholder="Leave blank to use the global persona">'+esc(a.persona||'')+'</textarea>'+
       '<div class="acctStyle">'+
         '<div><div class="label">Chattiness %</div><input class="acctChatty" type="number" min="0" max="100" value="'+Number(a.chattinessPercent??50)+'"></div>'+
@@ -1475,7 +1488,7 @@ function renderAccounts(k){
       '<label class="toggle" style="margin-top:7px"><input class="acctMention" type="checkbox" '+(a.mentionUsers?'checked':'')+'> @username viewers when replying</label>'+
       '<div class="acctBtns"><button class="small primary saveAccountStyle" data-id="'+esc(a.id)+'">Save account settings</button></div>'+
       '<div class="acctMeta">Proxy: '+esc(a.proxyConfigured?(a.proxyDisplay||'configured'):'direct')+'</div>'+
-      '<div class="proxyRow"><input class="proxyInput" data-id="'+esc(a.id)+'" placeholder="http://user:pass@host:port or socks5://user:pass@host:port"><button class="small saveProxy" data-id="'+esc(a.id)+'">Save proxy</button><button class="small testProxy" data-id="'+esc(a.id)+'">Test</button><button class="small clearProxy" data-id="'+esc(a.id)+'">Clear</button></div>'+
+      '<div class="proxyRow"><input class="proxyInput" data-id="'+esc(a.id)+'" placeholder="129.23.23.15:1855"><button class="small saveProxy" data-id="'+esc(a.id)+'">Save proxy</button><button class="small testProxy" data-id="'+esc(a.id)+'">Test</button><button class="small clearProxy" data-id="'+esc(a.id)+'">Clear</button></div>'+
       '<div class="acctMeta '+(a.proxyTest?.ok?'ok':(a.proxyTest?'bad':''))+'">'+esc(proxyTest)+'</div>'+
       '<div class="acctBtns"><button class="small primary connectAcct" data-id="'+esc(a.id)+'">'+(a.connected?'Reconnect':'Connect')+'</button><button class="small useAcct" data-id="'+esc(a.id)+'">Use</button><button class="small disconnectAcct" data-id="'+esc(a.id)+'">Disconnect</button><button class="small danger deleteAcct" data-id="'+esc(a.id)+'">Remove</button></div>'+
     '</div>';
@@ -1490,6 +1503,7 @@ function bindAccountButtons(){
     try{
       const card=b.closest('.acct');
       await jf("/api/accounts/"+encodeURIComponent(b.dataset.id)+"/style",{method:"POST",body:JSON.stringify({
+        kickLoginUsername:card.querySelector('.kickLoginUsernameInput').value,
         persona:card.querySelector('.accountPersonaInput').value,
         chattinessPercent:Number(card.querySelector('.acctChatty').value),
         viewerReplyPercent:Number(card.querySelector('.acctViewerPct').value),
